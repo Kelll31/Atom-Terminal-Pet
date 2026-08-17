@@ -1,0 +1,24 @@
+rules:
+  - id: rule_high_temp
+    description: "Trigger panic emotion if CPU temp is high"
+    condition:
+      metric: "temp"
+      operator: ">"
+      value: 85
+      duration_seconds: 5
+    action:
+      type: "set_emotion"
+      emotion: "panic"
+      text: "HOT!"
+      
+  - id: rule_idle
+    description: "Trigger sleepy emotion if CPU usage is very low for a while"
+    condition:
+      metric: "cpu"
+      operator: "<"
+      value: 5
+      duration_seconds: 30
+    action:
+      type: "set_emotion"
+      emotion: "sleepy"
+      text: "Zzz..."

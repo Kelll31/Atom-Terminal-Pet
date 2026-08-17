@@ -17,3 +17,13 @@ platformio>=6.1.19
 miniaudio
 pydub
 python-dotenv
+
+psutil
+GPUtil
+winrt-Windows.Media.Control
+pydantic
+
+langgraph
+langchain-core
+
+pyyaml
