@@ -16,3 +16,4 @@ langchain-ollama
 platformio>=6.1.19
 miniaudio
 pydub
+python-dotenv

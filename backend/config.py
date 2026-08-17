@@ -2,6 +2,10 @@ import os
 import yaml
 from pydantic import BaseModel
 from typing import Optional
+from dotenv import load_dotenv
+
+ENV_FILE = os.path.join(os.path.dirname(__file__), "..", ".env")
+load_dotenv(ENV_FILE)
 
 CONFIG_FILE = os.path.join(os.path.dirname(__file__), "config.yaml")
 
@@ -41,18 +45,25 @@ class SystemSettings(BaseModel):
 
 
 def load_config() -> SystemSettings:
-    if not os.path.exists(CONFIG_FILE):
-        return SystemSettings()
+    settings = SystemSettings()
     
-    with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-        data = yaml.safe_load(f)
-        if not data:
-            return SystemSettings()
+    if os.path.exists(CONFIG_FILE):
+        with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+            data = yaml.safe_load(f)
+            if data:
+                mcp_data = data.pop("mcp_tools", {})
+                settings = SystemSettings(**data)
+                settings.mcp_tools = MCPSettings(**mcp_data)
+                
+    # Override with .env variables if they exist
+    if os.getenv("OPENAI_API_KEY"):
+        settings.openai_api_key = os.getenv("OPENAI_API_KEY")
+    if os.getenv("ANTHROPIC_API_KEY"):
+        settings.anthropic_api_key = os.getenv("ANTHROPIC_API_KEY")
+    if os.getenv("OPENROUTER_API_KEY"):
+        settings.openrouter_api_key = os.getenv("OPENROUTER_API_KEY")
         
-        mcp_data = data.pop("mcp_tools", {})
-        settings = SystemSettings(**data)
-        settings.mcp_tools = MCPSettings(**mcp_data)
-        return settings
+    return settings
 
 def save_config(settings: SystemSettings):
     with open(CONFIG_FILE, "w", encoding="utf-8") as f:
