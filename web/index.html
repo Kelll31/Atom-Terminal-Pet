@@ -1,0 +1,516 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI Companion Dashboard</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <style>
+        body { background-color: #f8f9fa; }
+        .log-container {
+            height: 300px;
+            overflow-y: scroll;
+            background-color: #1e1e1e;
+            color: #00ff00;
+            font-family: monospace;
+            padding: 10px;
+            border-radius: 5px;
+        }
+    </style>
+</head>
+<body>
+
+<div class="container mt-5">
+    <div class="row">
+        <div class="col-md-6">
+            <h2>Настройки Компаньона</h2>
+            <div class="card mb-3">
+                <div class="card-body">
+                    <form id="settings-form">
+                        <div class="mb-3">
+                            <label class="form-label font-weight-bold">🐶 Кличка питомца</label>
+                            <input type="text" class="form-control" id="pet_name" placeholder="Атом" value="Атом" required>
+                        </div>
+
+                        <div class="mb-3">
+                            <label class="form-label">Провайдер LLM</label>
+                            <select class="form-select" id="llm_provider">
+                                <option value="openai">OpenAI</option>
+                                <option value="openrouter">OpenRouter</option>
+                                <option value="local">Локальная (Ollama)</option>
+                            </select>
+                        </div>
+                        
+                        <div class="mb-3 provider-group" id="group-openai">
+                            <label class="form-label">OpenAI API Key</label>
+                            <input type="password" class="form-control" id="openai_api_key">
+                        </div>
+
+                        <div class="provider-group" id="group-openrouter" style="display: none;">
+                            <div class="mb-3">
+                                <label class="form-label">OpenRouter API Key</label>
+                                <input type="password" class="form-control" id="openrouter_api_key">
+                            </div>
+                            <div class="mb-3">
+                                <label class="form-label">OpenRouter Model</label>
+                                <input type="text" class="form-control" id="openrouter_model" placeholder="openai/gpt-4o-mini">
+                            </div>
+                        </div>
+
+                        <div class="mb-3 provider-group" id="group-local" style="display: none;">
+                            <label class="form-label">Локальный LLM URL (Ollama)</label>
+                            <input type="text" class="form-control" id="local_llm_url">
+                        </div>
+
+                        <div class="mb-3">
+                            <label class="form-label">Системный Промпт</label>
+                            <textarea class="form-control" id="system_prompt" rows="3"></textarea>
+                        </div>
+
+                        <hr>
+                        <h5>Доступные MCP Инструменты</h5>
+                        <div class="form-check form-switch">
+                            <input class="form-check-input" type="checkbox" id="mcp_volume">
+                            <label class="form-check-label">Управление громкостью</label>
+                        </div>
+                        <div class="form-check form-switch">
+                            <input class="form-check-input" type="checkbox" id="mcp_keyboard">
+                            <label class="form-check-label">Эмуляция клавиатуры</label>
+                        </div>
+                        <div class="form-check form-switch">
+                            <input class="form-check-input" type="checkbox" id="mcp_apps">
+                            <label class="form-check-label">Запуск программ</label>
+                        </div>
+
+                        <button type="submit" class="btn btn-primary mt-3">Сохранить настройки</button>
+                    </form>
+                </div>
+            </div>
+
+            <h2>🎙️ Общение через ПК (Динамик и Микрофон)</h2>
+            <div class="card mb-3 text-center">
+                <div class="card-body">
+                    <div class="mb-2">
+                        <span id="pet-emotion-icon" style="font-size: 3.5rem;">😊</span>
+                        <div id="pet-emotion-label" class="small text-muted fw-bold">Счастливый</div>
+                    </div>
+
+                    <button type="button" class="btn btn-danger btn-lg w-100 mb-3" id="btn-record-pc">
+                        🎤 Удерживайте для записи речи на ПК
+                    </button>
+
+                    <div class="input-group">
+                        <input type="text" class="form-control" id="pc-text-input" placeholder="Напишите Атому запрос...">
+                        <button class="btn btn-outline-secondary" type="button" id="btn-send-pc-text">Отправить</button>
+                    </div>
+                </div>
+            </div>
+
+        </div>
+        
+        <div class="col-md-6">
+            <h2>Прошивка и Настройка M5Stack</h2>
+            <div class="card mb-3">
+                <div class="card-body">
+                    <h5>1. Установка прошивки</h5>
+                    <p>Подключите M5Stack к ПК по USB и нажмите кнопку ниже, чтобы прошить устройство прямо из браузера.</p>
+                    <script type="module" src="https://unpkg.com/esp-web-tools@9.4.2/dist/web/install-button.js?module"></script>
+                    <esp-web-install-button manifest="/firmware/manifest.json"></esp-web-install-button>
+                    <small class="d-block mt-2 text-muted">* Работает в Chrome, Edge, Opera.</small>
+
+                    <hr class="my-4">
+
+                    <h5>2. Настройка Wi-Fi и Сервера</h5>
+                    <p class="small text-muted mb-2">Нажмите «Авто-определение», чтобы система сама подтянула Wi-Fi и IP вашего ПК.</p>
+                    
+                    <button type="button" class="btn btn-outline-primary btn-sm mb-3 w-100" id="btn-autodetect-pc">
+                        ⚡ Авто-определение с ПК (Wi-Fi + IP)
+                    </button>
+
+                    <form id="usb-config-form">
+                        <div class="mb-2">
+                            <label class="form-label mb-1">Wi-Fi SSID (Имя сети)</label>
+                            <input type="text" class="form-control form-control-sm" id="usb_wifi_ssid" placeholder="Home_WiFi" required>
+                        </div>
+                        <div class="mb-2">
+                            <label class="form-label mb-1">Wi-Fi Пароль</label>
+                            <input type="text" class="form-control form-control-sm" id="usb_wifi_pass" placeholder="Пароль сети">
+                        </div>
+                        <div class="mb-3">
+                            <label class="form-label mb-1">IP Сервера (Бэкенда)</label>
+                            <input type="text" class="form-control form-control-sm" id="usb_server_ip" placeholder="192.168.1.100" required>
+                        </div>
+                        
+                        <div class="d-grid gap-2">
+                            <button type="button" class="btn btn-primary btn-sm" id="btn-compile-firmware">
+                                🔨 Вшить данные в прошивку перед прошивкой
+                            </button>
+                            <button type="button" class="btn btn-success btn-sm" id="btn-send-usb-config">
+                                🔌 Передать настройки на M5Stack по USB
+                            </button>
+                        </div>
+                    </form>
+
+                    <div id="usb-status" class="mt-3 alert alert-secondary p-2 d-none" style="font-size: 0.85rem;"></div>
+                </div>
+            </div>
+
+            <h2>Логи системы (Live)</h2>
+            <div class="log-container" id="logs"></div>
+        </div>
+    </div>
+</div>
+
+<script>
+    function updateProviderUI() {
+        const provider = document.getElementById('llm_provider').value;
+        document.querySelectorAll('.provider-group').forEach(el => el.style.display = 'none');
+        
+        if (provider === 'openai') {
+            document.getElementById('group-openai').style.display = 'block';
+        } else if (provider === 'openrouter') {
+            document.getElementById('group-openrouter').style.display = 'block';
+        } else if (provider === 'local') {
+            document.getElementById('group-local').style.display = 'block';
+        }
+    }
+
+    document.getElementById('llm_provider').addEventListener('change', updateProviderUI);
+
+    // Auto-detect PC network info (Wi-Fi SSID, Password, Server IP)
+    async function autoDetectPCInfo() {
+        const statusDiv = document.getElementById('usb-status');
+        statusDiv.className = 'mt-3 alert alert-info p-2';
+        statusDiv.classList.remove('d-none');
+        statusDiv.innerText = 'Определение настроек сети ПК...';
+
+        try {
+            const resp = await fetch('/api/autodetect');
+            const data = await resp.json();
+            
+            if (data.ssid) document.getElementById('usb_wifi_ssid').value = data.ssid;
+            if (data.pass) document.getElementById('usb_wifi_pass').value = data.pass;
+            if (data.server_ip) document.getElementById('usb_server_ip').value = data.server_ip;
+
+            statusDiv.className = 'mt-3 alert alert-success p-2';
+            statusDiv.innerText = `✅ Настройки сети автоматически подтянуты с ПК! (Wi-Fi: ${data.ssid || 'не определен'}, IP: ${data.server_ip})`;
+        } catch (e) {
+            console.error('Ошибка авто-определения:', e);
+            statusDiv.className = 'mt-3 alert alert-warning p-2';
+            statusDiv.innerText = 'Не удалось автоматически определить Wi-Fi с ПК.';
+        }
+    }
+
+    document.getElementById('btn-autodetect-pc').addEventListener('click', autoDetectPCInfo);
+
+    // Auto-detect on initial load
+    autoDetectPCInfo();
+
+    // Compile firmware with pre-baked Wi-Fi settings
+    document.getElementById('btn-compile-firmware').addEventListener('click', async () => {
+        const ssid = document.getElementById('usb_wifi_ssid').value.trim();
+        const pass = document.getElementById('usb_wifi_pass').value.trim();
+        const server = document.getElementById('usb_server_ip').value.trim();
+        const statusDiv = document.getElementById('usb-status');
+
+        if (!ssid || !server) {
+            alert('Укажите Wi-Fi SSID и IP Сервера.');
+            return;
+        }
+
+        statusDiv.className = 'mt-3 alert alert-info p-2';
+        statusDiv.classList.remove('d-none');
+        statusDiv.innerText = '🔨 Компиляция прошивки с вашими данными Wi-Fi... Это займет 10-15 секунд.';
+
+        try {
+            const resp = await fetch('/api/compile_firmware', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ ssid, pass, server_ip: server })
+            });
+            const res = await resp.json();
+
+            if (res.status === 'success') {
+                statusDiv.className = 'mt-3 alert alert-success p-2';
+                statusDiv.innerText = '✅ Прошивка успешно собрана с зашитыми данными! Теперь нажмите кнопку CONNECT выше для прошивки M5Stack.';
+            } else {
+                statusDiv.className = 'mt-3 alert alert-danger p-2';
+                statusDiv.innerText = 'Ошибка сборки: ' + res.message;
+            }
+        } catch (e) {
+            console.error('Ошибка компиляции:', e);
+            statusDiv.className = 'mt-3 alert alert-danger p-2';
+            statusDiv.innerText = 'Ошибка запроса к серверу: ' + e;
+        }
+    });
+
+    // Emotion Map for Web UI
+    const emotionMap = {
+        happy: { icon: '😊', label: 'Счастливый' },
+        tool: { icon: '⚙️', label: 'Выполняет MCP инструмент' },
+        thinking: { icon: '🤔', label: 'Думает...' },
+        surprised: { icon: '😮', label: 'Удивленный' },
+        talking: { icon: '🗣️', label: 'Разговаривает' },
+        recording: { icon: '🎤', label: 'Слушает речь...' },
+        sad: { icon: '😢', label: 'Грустный' }
+    };
+
+    function updatePetEmotionUI(emotion) {
+        const info = emotionMap[emotion] || emotionMap.happy;
+        document.getElementById('pet-emotion-icon').innerText = info.icon;
+        document.getElementById('pet-emotion-label').innerText = info.label;
+    }
+
+    // 1. Fetch current settings
+    async function fetchSettings() {
+        try {
+            const response = await fetch('/api/settings');
+            const data = await response.json();
+            
+            if (data.pet_name) document.getElementById('pet_name').value = data.pet_name;
+            document.getElementById('llm_provider').value = data.llm_provider;
+            document.getElementById('openai_api_key').value = data.openai_api_key || '';
+            document.getElementById('openrouter_api_key').value = data.openrouter_api_key || '';
+            document.getElementById('openrouter_model').value = data.openrouter_model || 'openai/gpt-4o-mini';
+            document.getElementById('local_llm_url').value = data.local_llm_url || '';
+            document.getElementById('system_prompt').value = data.system_prompt || '';
+            
+            document.getElementById('mcp_volume').checked = data.mcp_tools.volume_control;
+            document.getElementById('mcp_keyboard').checked = data.mcp_tools.keyboard_control;
+            document.getElementById('mcp_apps').checked = data.mcp_tools.app_launcher;
+
+            updateProviderUI();
+        } catch (err) {
+            console.error("Ошибка при получении настроек", err);
+        }
+    }
+
+    // 2. Save settings
+    document.getElementById('settings-form').addEventListener('submit', async (e) => {
+        e.preventDefault();
+        
+        const payload = {
+            pet_name: document.getElementById('pet_name').value.trim() || "Атом",
+            llm_provider: document.getElementById('llm_provider').value,
+            openai_api_key: document.getElementById('openai_api_key').value,
+            anthropic_api_key: "",
+            openrouter_api_key: document.getElementById('openrouter_api_key').value,
+            openrouter_model: document.getElementById('openrouter_model').value,
+            local_llm_url: document.getElementById('local_llm_url').value,
+            system_prompt: document.getElementById('system_prompt').value,
+            mcp_tools: {
+                volume_control: document.getElementById('mcp_volume').checked,
+                keyboard_control: document.getElementById('mcp_keyboard').checked,
+                app_launcher: document.getElementById('mcp_apps').checked
+            }
+        };
+
+        try {
+            await fetch('/api/settings', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload)
+            });
+            alert('Настройки сохранены!');
+        } catch (err) {
+            console.error("Ошибка при сохранении", err);
+            alert('Ошибка при сохранении!');
+        }
+    });
+
+    // 3. PC Audio & Voice Chat (PC Mic & PC Speakers)
+    let mediaRecorder = null;
+    let audioChunks = [];
+    const btnRecordPC = document.getElementById('btn-record-pc');
+
+    async function sendAudioToBackend(audioBlob) {
+        updatePetEmotionUI('thinking');
+        try {
+            const resp = await fetch('/api/pc_audio', {
+                method: 'POST',
+                headers: { 'Content-Type': 'audio/webm' },
+                body: audioBlob
+            });
+            
+            const replyText = decodeURIComponent(resp.headers.get('X-Reply-Text') || '');
+            const emotion = resp.headers.get('X-Emotion') || 'happy';
+            updatePetEmotionUI(emotion);
+
+            if (resp.ok) {
+                const blob = await resp.blob();
+                const audioUrl = URL.createObjectURL(blob);
+                const audio = new Audio(audioUrl);
+                audio.play();
+            }
+        } catch (e) {
+            console.error('Ошибка отправки аудио с ПК:', e);
+            updatePetEmotionUI('sad');
+        }
+    }
+
+    async function sendTextToBackend(text) {
+        if (!text) return;
+        updatePetEmotionUI('thinking');
+        try {
+            const resp = await fetch('/api/pc_audio', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ text })
+            });
+
+            const replyText = decodeURIComponent(resp.headers.get('X-Reply-Text') || '');
+            const emotion = resp.headers.get('X-Emotion') || 'happy';
+            updatePetEmotionUI(emotion);
+
+            if (resp.ok) {
+                const blob = await resp.blob();
+                const audioUrl = URL.createObjectURL(blob);
+                const audio = new Audio(audioUrl);
+                audio.play();
+            }
+        } catch (e) {
+            console.error('Ошибка отправки текста:', e);
+            updatePetEmotionUI('sad');
+        }
+    }
+
+    // PC Microphone Recording Events (Mouse down / Touch start to record)
+    btnRecordPC.addEventListener('mousedown', async () => {
+        try {
+            const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+            mediaRecorder = new MediaRecorder(stream);
+            audioChunks = [];
+            
+            mediaRecorder.ondataavailable = (event) => {
+                if (event.data.size > 0) audioChunks.push(event.data);
+            };
+
+            mediaRecorder.onstop = () => {
+                const audioBlob = new Blob(audioChunks, { type: 'audio/webm' });
+                sendAudioToBackend(audioBlob);
+                stream.getTracks().forEach(track => track.stop());
+            };
+
+            mediaRecorder.start();
+            btnRecordPC.innerText = '🔴 Идет запись... Отпустите для отправки';
+            btnRecordPC.className = 'btn btn-warning btn-lg w-100 mb-3';
+            updatePetEmotionUI('recording');
+        } catch (err) {
+            alert('Не удалось получить доступ к микрофону ПК: ' + err.message);
+        }
+    });
+
+    btnRecordPC.addEventListener('mouseup', () => {
+        if (mediaRecorder && mediaRecorder.state === 'recording') {
+            mediaRecorder.stop();
+            btnRecordPC.innerText = '🎤 Удерживайте для записи речи на ПК';
+            btnRecordPC.className = 'btn btn-danger btn-lg w-100 mb-3';
+        }
+    });
+
+    document.getElementById('btn-send-pc-text').addEventListener('click', () => {
+        const input = document.getElementById('pc-text-input');
+        const text = input.value.trim();
+        if (text) {
+            sendTextToBackend(text);
+            input.value = '';
+        }
+    });
+
+
+    // 3. WebSerial Configuration Logic
+
+    document.getElementById('btn-send-usb-config').addEventListener('click', async () => {
+        const ssid = document.getElementById('usb_wifi_ssid').value.trim();
+        const pass = document.getElementById('usb_wifi_pass').value.trim();
+        const server = document.getElementById('usb_server_ip').value.trim();
+        const statusDiv = document.getElementById('usb-status');
+
+        if (!ssid || !server) {
+            alert('Пожалуйста, укажите Wi-Fi SSID и IP Сервера.');
+            return;
+        }
+
+        if (!('serial' in navigator)) {
+            alert('Ваш браузер не поддерживает WebSerial API. Пожалуйста, используйте Chrome, Edge или Opera.');
+            return;
+        }
+
+        statusDiv.className = 'mt-3 alert alert-info p-2';
+        statusDiv.innerText = 'Выберите COM-порт устройства M5Stack в выпадающем окне браузера...';
+
+        try {
+            const port = await navigator.serial.requestPort();
+            await port.open({ baudRate: 115200 });
+
+            statusDiv.innerText = 'Порт открыт. Передача конфигурации...';
+
+            const encoder = new TextEncoder();
+            const decoder = new TextDecoder();
+            const writer = port.writable.getWriter();
+            const reader = port.readable.getReader();
+
+            const payload = JSON.stringify({ ssid, pass, server }) + '\n';
+            await writer.write(encoder.encode(payload));
+
+            statusDiv.innerText = 'Настройки отправлены! Ожидание ответа M5Stack...';
+
+            let responseText = '';
+            const timeout = setTimeout(() => {
+                try { reader.cancel(); } catch(e){}
+            }, 6000);
+
+            try {
+                while (true) {
+                    const { value, done } = await reader.read();
+                    if (done) break;
+                    if (value) {
+                        responseText += decoder.decode(value);
+                        if (responseText.includes('\n') || responseText.includes('ok')) break;
+                    }
+                }
+            } catch (e) {
+                console.log('Read loop finished or cancelled:', e);
+            } finally {
+                clearTimeout(timeout);
+                try { writer.releaseLock(); } catch(e){}
+                try { reader.releaseLock(); } catch(e){}
+                try { await port.close(); } catch(e){}
+            }
+
+            statusDiv.className = 'mt-3 alert alert-success p-2';
+            statusDiv.innerText = '✅ Настройки успешно переданы на M5Stack! Устройство сохранит их и подключится к Wi-Fi.';
+
+        } catch (err) {
+            console.error('Ошибка WebSerial:', err);
+            statusDiv.className = 'mt-3 alert alert-danger p-2';
+            statusDiv.innerText = 'Ошибка при работе с USB COM-портом: ' + (err.message || err);
+        }
+    });
+
+    // 4. WebSocket Logs
+    const logDiv = document.getElementById('logs');
+    function connectLogs() {
+        const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+        const wsUrl = `${protocol}//${window.location.host}/ws/logs`;
+        const ws = new WebSocket(wsUrl);
+
+        ws.onmessage = (event) => {
+            const time = new Date().toLocaleTimeString();
+            const logEntry = `<div>[${time}] ${event.data}</div>`;
+            logDiv.innerHTML += logEntry;
+            logDiv.scrollTop = logDiv.scrollHeight;
+        };
+
+        ws.onclose = () => {
+            setTimeout(connectLogs, 2000); // Reconnect logic
+        };
+    }
+
+    // Initialize
+    fetchSettings();
+    connectLogs();
+</script>
+
+</body>
+</html>
