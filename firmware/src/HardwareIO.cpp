@@ -19,6 +19,8 @@ HardwareIO::HardwareIO() {
     recordBuffer = nullptr;
     recordIndex = 0;
     recording = false;
+    playing = false;
+    lastPlayCallTime = 0;
 }
 
 #include <Wire.h>
@@ -31,17 +33,6 @@ void HardwareIO::init() {
         Serial.println("Failed to initialize EchoBase!");
     }
     
-    // Force ES8311 SDP format to 16-bit I2S to match ESP32 16-bit driver
-    Wire.beginTransmission(0x18);
-    Wire.write(0x09); // SDPIN (DAC)
-    Wire.write(0x0C); // 16-bit I2S format
-    Wire.endTransmission();
-
-    Wire.beginTransmission(0x18);
-    Wire.write(0x0A); // SDPOUT (ADC)
-    Wire.write(0x0C); // 16-bit I2S format
-    Wire.endTransmission();
-
     // Configure ES8311 volumes (75% to prevent NS4150B amp clipping/distortion)
     echobase.setSpeakerVolume(75); 
     echobase.setMicGain(ES8311_MIC_GAIN_18DB); // Give the mic some good gain
@@ -54,8 +45,8 @@ void HardwareIO::init() {
 void HardwareIO::playTone(int freq, int duration) {
     if (freq <= 0 || duration <= 0) return;
     int samples = (16000 * duration) / 1000;
-    size_t stereoBytes = samples * 4; // 16-bit Stereo
-    uint8_t* toneBuf = (uint8_t*)malloc(stereoBytes);
+    size_t bytes = samples * 4; // 16-bit Stereo
+    uint8_t* toneBuf = (uint8_t*)malloc(bytes);
     if (!toneBuf) return;
     int halfPeriod = 16000 / freq / 2;
     if (halfPeriod == 0) halfPeriod = 1;
@@ -65,32 +56,41 @@ void HardwareIO::playTone(int freq, int duration) {
         p[i * 2]     = val; // Left
         p[i * 2 + 1] = val; // Right
     }
-    echobase.play(toneBuf, stereoBytes, false);
+    // Use blocking=true so all bytes are guaranteed written to I2S DMA.
+    // Non-blocking mode silently drops audio when DMA buffer is busy (causes chipmunk/no audio).
+    echobase.play(toneBuf, bytes, true);
     free(toneBuf);
 }
 
 void HardwareIO::playAudioStream(const uint8_t* payload, size_t length) {
     if (!payload || length == 0) return;
+
     size_t monoSamples = length / 2;
-    size_t stereoBytes = monoSamples * 4;
+    size_t stereoBytes = monoSamples * 4; // 16-bit Stereo
     
-    // Allocate temporary buffer for mono -> stereo expansion
     uint8_t* stereoBuf = (uint8_t*)malloc(stereoBytes);
     if (!stereoBuf) return;
     
     const int16_t* src = (const int16_t*)payload;
     int16_t* dst = (int16_t*)stereoBuf;
     for (size_t i = 0; i < monoSamples; i++) {
-        dst[i * 2]     = src[i]; // Left channel
-        dst[i * 2 + 1] = src[i]; // Right channel
+        dst[i * 2]     = src[i]; // Left
+        dst[i * 2 + 1] = src[i]; // Right
     }
-    echobase.play(stereoBuf, stereoBytes, false);
+    lastPlayCallTime = millis(); // Track for echo prevention in loop()
+    playing = true;
+    // blocking=true: waits until all bytes fit in I2S DMA. Ensures no audio is dropped.
+    // Each 4096-byte mono chunk = 128ms at 16kHz. Blocking time per call ~18ms (DMA overlap drain).
+    echobase.play(stereoBuf, stereoBytes, true);
+    playing = false;
     free(stereoBuf);
 }
 
 void HardwareIO::stopAudioPlayback() {
-    uint8_t silence[1024] = {0};
-    echobase.play(silence, sizeof(silence), true); // Write silence and clear DMA
+    // 8192 bytes of silence ensures the 32-bit stereo DMA buffer is fully flushed
+    static const uint8_t silence[8192] = {0};
+    echobase.play(silence, sizeof(silence), true);
+    playing = false; // Reset playback state
 }
 
 void HardwareIO::startRecording() {
@@ -114,20 +114,19 @@ void HardwareIO::update() {
     updateIMU();
     checkButtons();
     
-    // Handle mic recording continuously if active (suppressed while pet is speaking)
+    // Handle mic recording continuously if active
     if (recording && petState.getEmotion() != PetEmotion::TALKING) {
-        uint8_t rawBuf[1024];
+        uint8_t rawBuf[1024]; // 256 stereo frames × 4 bytes = 1024 bytes
         if (echobase.record(rawBuf, 1024)) {
-            // Convert 1024 bytes 16-bit Stereo (256 sample pairs) -> 512 bytes 16-bit Mono
             int16_t* src = (int16_t*)rawBuf;
             int16_t* dst = (int16_t*)&recordBuffer[recordIndex];
-            int samples = 1024 / 4; // 256 samples
+            int samples = 1024 / 4; // 256 stereo frames
             for (int i = 0; i < samples; i++) {
-                // Average Left and Right channel samples to get Mono
-                int32_t mix = ((int32_t)src[i * 2] + (int32_t)src[i * 2 + 1]) / 2;
-                dst[i] = (int16_t)mix;
+                int16_t left = src[i * 2];
+                int16_t right = src[i * 2 + 1];
+                dst[i] = (left + right) / 2;
             }
-            size_t monoBytes = samples * 2; // 512 bytes
+            size_t monoBytes = samples * 2; // 512 bytes of 16-bit mono
             if (recordIndex + monoBytes <= RECORD_BUFFER_SIZE) {
                 recordIndex += monoBytes;
             }

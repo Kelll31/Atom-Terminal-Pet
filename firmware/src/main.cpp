@@ -24,6 +24,8 @@ WebSocketsClient webSocket;
 bool is_wifi_connected = false;
 bool is_ws_connected = false;
 unsigned long lastAudioRxTime = 0;
+bool wsJustConnected = false;       // Flag: transition to LISTENING after WS connect
+unsigned long wsConnectTime = 0;    // Time of last WS connection
 
 // Task handles
 TaskHandle_t renderTaskHandle;
@@ -141,6 +143,8 @@ void webSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
         case WStype_CONNECTED:
             is_ws_connected = true;
             petState.setEmotion(PetEmotion::HAPPY, "Online");
+            wsJustConnected = true;    // Will auto-transition to LISTENING after 3s
+            wsConnectTime = millis();
             {
                 StaticJsonDocument<256> statusDoc;
                 statusDoc["action"] = "device_status";
@@ -352,21 +356,30 @@ void loop() {
     
     processSerial();
     
-    // Auto-detect end of audio playback (no audio chunks for 350ms)
-    if (petState.getEmotion() == PetEmotion::TALKING && millis() - lastAudioRxTime > 350) {
+    // Auto-detect end of audio playback.
+    // Wait for BOTH conditions to prevent echo (mic picking up speaker):
+    //   1. Backend has stopped sending chunks (350ms silence on WebSocket)
+    //   2. I2S DMA has drained after last play() call (500ms > chunk duration of 128ms)
+    unsigned long now = millis();
+    if (petState.getEmotion() == PetEmotion::TALKING 
+        && (now - lastAudioRxTime > 350)
+        && (now - hardwareIO.getLastPlayTime() > 500)) {
         hardwareIO.stopAudioPlayback(); // Zero out DMA buffer to eliminate repeating noise
         hardwareIO.resetRecordBuffer(); // Flush mic buffer recorded during speech
         petState.setEmotion(PetEmotion::LISTENING, "Listening...");
     }
 
     // Handle continuous audio streaming
+    // IMPORTANT: send via only ONE channel to prevent duplicate STT/TTS pipeline triggers.
+    // When WiFi is connected, M5 uses WebSocket; Serial is fallback for USB-only mode.
     if (hardwareIO.isRecording() && hardwareIO.hasAudioChunk() && petState.getEmotion() != PetEmotion::TALKING) {
         size_t len = hardwareIO.getRecordSize();
         if (len > 0) {
             if (is_ws_connected) {
-                webSocket.sendBIN(hardwareIO.getRecordBuffer(), len);
+                webSocket.sendBIN(hardwareIO.getRecordBuffer(), len); // WiFi preferred
+            } else {
+                sendSerialData(0x02, hardwareIO.getRecordBuffer(), len); // USB-only fallback
             }
-            sendSerialData(0x02, hardwareIO.getRecordBuffer(), len);
         }
         hardwareIO.resetRecordBuffer();
     }
@@ -386,6 +399,15 @@ void loop() {
         }
     } else {
         wasShaking = false;
+    }
+    
+    // Auto-transition from HAPPY to LISTENING state after WebSocket connects.
+    // Without this, device stays HAPPY forever (no LISTENING animation shown until first TTS).
+    if (wsJustConnected && millis() - wsConnectTime > 3000) {
+        wsJustConnected = false;
+        if (hardwareIO.isRecording() && petState.getEmotion() == PetEmotion::HAPPY) {
+            petState.setEmotion(PetEmotion::LISTENING, "Listening...");
+        }
     }
     
     // Don't starve watchdog

@@ -29,6 +29,10 @@ public:
     void resetRecordBuffer() { recordIndex = 0; }
     bool hasAudioChunk() const { return recordIndex >= RECORD_BUFFER_SIZE; }
 
+    // Playback state
+    bool isPlaying() const { return playing; }
+    unsigned long getLastPlayTime() const { return lastPlayCallTime; }
+
 private:
     float pitch, roll, yaw;
     float ax, ay, az;
@@ -43,6 +47,8 @@ private:
     uint8_t* recordBuffer;
     size_t recordIndex;
     bool recording;
+    bool playing;        // set true during echobase.play() call (informational)
+    unsigned long lastPlayCallTime; // millis() of last playAudioStream() call
     
     void updateIMU();
     void checkButtons();

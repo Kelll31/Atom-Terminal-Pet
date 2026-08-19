@@ -15,8 +15,8 @@ def process_tts_sync(text: str) -> bytes:
         spk = win32com.client.Dispatch("SAPI.SpVoice")
         strm = win32com.client.Dispatch("SAPI.SpMemoryStream")
 
-        # 30 = 16kHz 16Bit Mono PCM
-        strm.Format.Type = 30
+        # 18 = 16kHz 16Bit Mono PCM (SAFT16kHz16BitMono)
+        strm.Format.Type = 18
         spk.AudioOutputStream = strm
 
         spk.Speak(text)
@@ -29,9 +29,16 @@ def process_tts_sync(text: str) -> bytes:
         else:
             raw_bytes = bytes(data)
             
-        # Strip the 44-byte RIFF WAV header if present so it's pure PCM
-        if len(raw_bytes) > 44 and raw_bytes[:4] == b"RIFF":
-            raw_bytes = raw_bytes[44:]
+        # Properly parse RIFF/WAV to find the 'data' chunk — header size varies (44–46+ bytes)
+        if len(raw_bytes) > 12 and raw_bytes[:4] == b"RIFF" and raw_bytes[8:12] == b"WAVE":
+            offset = 12
+            while offset + 8 <= len(raw_bytes):
+                chunk_id = raw_bytes[offset:offset + 4]
+                chunk_size = int.from_bytes(raw_bytes[offset + 4:offset + 8], "little")
+                if chunk_id == b"data":
+                    raw_bytes = raw_bytes[offset + 8:]
+                    break
+                offset += 8 + chunk_size
 
         pythoncom.CoUninitialize()
         return raw_bytes

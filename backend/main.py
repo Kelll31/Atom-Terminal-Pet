@@ -184,14 +184,22 @@ async def handle_audio_stream(audio_data: bytes, exclude_ws: WebSocket = None, s
             # TTS Pipeline
             audio_response = await generate_speech(ai_response_text)
 
-            # Send audio to all clients in 4096-byte chunks
+            # Send audio chunks via ONE channel only to prevent M5 receiving duplicates:
+            # - WebSocket broadcast covers M5 (WiFi mode) and Web UI clients.
+            # - Serial is used ONLY when no WebSocket clients are connected (USB-only mode).
+            # Sleep 110ms between 4096-byte chunks (each = 128ms at 16kHz 16-bit mono).
+            # This paces delivery to match I2S playback rate, preventing DMA buffer overflow
+            # which caused dropped chunks -> temporal compression -> chipmunk distortion.
             if audio_response:
                 chunk_size = 4096
+                has_ws_clients = len(manager.active_connections) > 0
                 for i in range(0, len(audio_response), chunk_size):
                     chunk = audio_response[i:i+chunk_size]
-                    await manager.broadcast_binary(chunk)
-                    serial_manager.send_binary(chunk)
-                    await asyncio.sleep(0.01)
+                    if has_ws_clients:
+                        await manager.broadcast_binary(chunk)
+                    else:
+                        serial_manager.send_binary(chunk)  # USB-only fallback
+                    await asyncio.sleep(0.11)  # ~110ms: just under 128ms chunk duration
 
 async def handle_json_message(payload: dict, websocket: WebSocket = None):
     logger.info(f"Received JSON: {payload}")
@@ -229,15 +237,18 @@ async def handle_json_message(payload: dict, websocket: WebSocket = None):
         await manager.broadcast_json(msg)
         serial_manager.send_json(msg)
 
-        # Generate TTS and send binary in chunks
+        # Generate TTS and send binary via ONE channel only
         audio_response = await generate_speech(ai_response_text)
         if audio_response:
             chunk_size = 4096
+            has_ws_clients = len(manager.active_connections) > 0
             for i in range(0, len(audio_response), chunk_size):
                 chunk = audio_response[i:i+chunk_size]
-                await manager.broadcast_binary(chunk)
-                serial_manager.send_binary(chunk)
-                await asyncio.sleep(0.01)
+                if has_ws_clients:
+                    await manager.broadcast_binary(chunk)
+                else:
+                    serial_manager.send_binary(chunk)  # USB-only fallback
+                await asyncio.sleep(0.11)  # ~110ms: just under 128ms chunk duration
     elif action == "set_rotation":
         await manager.broadcast_json(payload)
         serial_manager.send_json(payload)
