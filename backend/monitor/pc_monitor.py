@@ -1,30 +1,40 @@
 import asyncio
-import psutil
 import logging
-import json
+
+import psutil
+
 from core.ws_manager import manager
 
 logger = logging.getLogger("monitor.pc_monitor")
 
 try:
     import GPUtil
+
     HAS_GPUTIL = True
 except ImportError:
     HAS_GPUTIL = False
-    logger.warning("GPUtil not found. GPU monitoring will be disabled. Install with: pip install gputil")
+    logger.warning(
+        "GPUtil not found. GPU monitoring will be disabled. Install with: pip install gputil"
+    )
 
 try:
-    from winrt.windows.media.control import GlobalSystemMediaTransportControlsSessionManager as MediaManager
+    from winrt.windows.media.control import (
+        GlobalSystemMediaTransportControlsSessionManager as MediaManager,
+    )
+
     HAS_WINSDK = True
 except ImportError:
     HAS_WINSDK = False
-    logger.warning("winrt not found. Spotify/Media monitoring disabled. Install with: pip install winrt-Windows.Media.Control")
+    logger.warning(
+        "winrt not found. Spotify/Media monitoring disabled. Install with: pip install winrt-Windows.Media.Control"
+    )
+
 
 class PCMonitor:
     def __init__(self, interval_sec=2.0):
         self.interval_sec = interval_sec
         self.is_running = False
-        
+
         # Simple Pomodoro state
         self.pomodoro_active = False
         self.pomodoro_time_left = 0
@@ -55,38 +65,40 @@ class PCMonitor:
         except Exception:
             pass
         return 0
-        
+
     def get_cpu_temp(self):
         # psutil temperatures are tricky on Windows, usually requires WMI or OpenHardwareMonitor.
         # We will return a mock or try a fallback if it exists.
         if hasattr(psutil, "sensors_temperatures"):
             temps = psutil.sensors_temperatures()
-            if temps and 'coretemp' in temps:
-                return int(temps['coretemp'][0].current)
-        return 40 # Mock default
+            if temps and "coretemp" in temps:
+                return int(temps["coretemp"][0].current)
+        return 40  # Mock default
 
     async def collect_metrics(self):
         cpu = int(psutil.cpu_percent(interval=None))
         ram = int(psutil.virtual_memory().percent)
         gpu = self.get_gpu_usage()
         temp = self.get_cpu_temp()
-        
+
         payload = {
             "action": "update_pc",
             "cpu": cpu,
             "ram": ram,
             "gpu": gpu,
-            "temp": temp
+            "temp": temp,
         }
-        
+
         media = await self.get_media_info()
         if media:
             payload["spotify"] = media
-            
+
         if self.pomodoro_active:
             payload["time_left"] = self.pomodoro_time_left
-            self.pomodoro_time_left = max(0, self.pomodoro_time_left - int(self.interval_sec))
-            
+            self.pomodoro_time_left = max(
+                0, self.pomodoro_time_left - int(self.interval_sec)
+            )
+
         return payload
 
     async def monitor_loop(self):
@@ -94,7 +106,7 @@ class PCMonitor:
         logger.info("PC Monitor started.")
         # Prime the CPU percent call
         psutil.cpu_percent()
-        
+
         while self.is_running:
             try:
                 if len(manager.active_connections) > 0:
@@ -117,5 +129,6 @@ class PCMonitor:
     def stop_pomodoro(self):
         self.pomodoro_active = False
         self.pomodoro_time_left = 0
+
 
 pc_monitor = PCMonitor()

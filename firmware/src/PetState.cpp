@@ -53,9 +53,13 @@ void PetState::update() {
     
     if ((currentEmotion == PetEmotion::LOVE || 
          currentEmotion == PetEmotion::HAPPY || 
+         currentEmotion == PetEmotion::ANGRY || 
          currentEmotion == PetEmotion::SAD || 
-         currentEmotion == PetEmotion::DIZZY) 
-        && (now - stateStartTime > 4000)) {
+         currentEmotion == PetEmotion::DIZZY ||
+         currentEmotion == PetEmotion::PANIC ||
+         currentEmotion == PetEmotion::SWEAT ||
+         currentEmotion == PetEmotion::PARTY) 
+        && (now - stateStartTime > 5000)) {
         setEmotion(PetEmotion::IDLE, "");
     }
 }

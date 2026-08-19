@@ -5,10 +5,12 @@ enum class PetEmotion {
     INIT,
     IDLE,
     HAPPY,
+    ANGRY,
     SAD,
     LOVE,
     DIZZY,
     SLEEPING,
+    SLEEPY = SLEEPING,
     WORKING,   // Pomodoro
     LISTENING, // Voice input
     TALKING,   // Voice output

@@ -1,24 +1,56 @@
-import logging
 import asyncio
+import logging
+
+import pythoncom
+import win32com.client
 
 logger = logging.getLogger("ai.tts")
 
-# For TTS, libraries like edge-tts are fully async out of the box.
+
+def process_tts_sync(text: str) -> bytes:
+    try:
+        # COM objects must be initialized per-thread
+        pythoncom.CoInitialize()
+
+        spk = win32com.client.Dispatch("SAPI.SpVoice")
+        strm = win32com.client.Dispatch("SAPI.SpMemoryStream")
+
+        # 30 = 16kHz 16Bit Mono PCM
+        strm.Format.Type = 30
+        spk.AudioOutputStream = strm
+
+        spk.Speak(text)
+
+        # Extract data
+        data = strm.GetData()
+
+        if isinstance(data, memoryview):
+            raw_bytes = data.tobytes()
+        else:
+            raw_bytes = bytes(data)
+            
+        # Strip the 44-byte RIFF WAV header if present so it's pure PCM
+        if len(raw_bytes) > 44 and raw_bytes[:4] == b"RIFF":
+            raw_bytes = raw_bytes[44:]
+
+        pythoncom.CoUninitialize()
+        return raw_bytes
+    except Exception as e:
+        logger.error(f"Error in SAPI TTS: {e}")
+        return b""
+
 
 async def generate_speech(text: str) -> bytes:
     """
-    Mock function to generate speech from text.
-    In reality, this would call edge-tts or OpenAI TTS,
-    and return the raw MP3 or PCM bytes to be streamed via WebSocket.
+    Generate speech from text using Windows offline TTS (SAPI5).
+    Returns 16kHz 16-bit Mono PCM raw bytes for the ESP32.
     """
     logger.info(f"Generating speech for text: {text}")
-    
-    # Simulate network/processing delay
-    await asyncio.sleep(0.5)
-    
-    # Return mock bytes (empty WAV/MP3 payload in reality)
-    # Just returning a dummy byte array for architecture completion
-    dummy_audio_bytes = b'\x00' * 1024 
-    logger.info("Generated 1024 bytes of dummy audio data.")
-    
-    return dummy_audio_bytes
+
+    if not text:
+        return b""
+
+    pcm_bytes = await asyncio.to_thread(process_tts_sync, text)
+
+    logger.info(f"Successfully generated {len(pcm_bytes)} bytes of PCM audio data.")
+    return pcm_bytes

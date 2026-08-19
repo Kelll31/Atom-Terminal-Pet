@@ -1,0 +1,6 @@
+mcpServers:
+  # Web Search using DuckDuckGo (No API Key Required)
+  web_search:
+    command: "node"
+    args:
+      - "node_modules/duckduckgo-websearch/build/index.js"

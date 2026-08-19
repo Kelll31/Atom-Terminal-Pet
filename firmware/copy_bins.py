@@ -13,7 +13,7 @@ def after_build(source, target, env):
     
     # Целевая папка веб-сервера
     project_dir = env.subst("$PROJECT_DIR")
-    target_dir = os.path.join(project_dir, "..", "web", "firmware")
+    target_dir = os.path.join(project_dir, "..", "web", "public", "firmware")
     
     if not os.path.exists(target_dir):
         os.makedirs(target_dir)

@@ -9,17 +9,21 @@
 #include "HardwareIO.h"
 #include "PCTracker.h"
 
+// Forward declarations
+void sendSerialData(uint8_t type, const uint8_t* data, uint32_t length);
+
 // Configuration
 Preferences preferences;
 char wifi_ssid[64] = "";
 char wifi_pass[64] = "";
 char server_ip[64] = "192.168.1.100";
 const int websocket_port = 8000;
-const char* websocket_path = "/ws/audio";
+const char* websocket_path = "/ws/pet";
 
 WebSocketsClient webSocket;
 bool is_wifi_connected = false;
 bool is_ws_connected = false;
+unsigned long lastAudioRxTime = 0;
 
 // Task handles
 TaskHandle_t renderTaskHandle;
@@ -30,8 +34,11 @@ void loadConfig() {
     String saved_ssid = preferences.getString("wifi_ssid", "");
     String saved_pass = preferences.getString("wifi_pass", "");
     String saved_ip   = preferences.getString("server_ip", "192.168.1.100");
+    int saved_rotation = preferences.getInt("rotation", 0);
     preferences.end();
     
+    M5.Display.setRotation(saved_rotation);
+
     strncpy(wifi_ssid, saved_ssid.c_str(), sizeof(wifi_ssid) - 1);
     strncpy(wifi_pass, saved_pass.c_str(), sizeof(wifi_pass) - 1);
     strncpy(server_ip, saved_ip.c_str(), sizeof(server_ip) - 1);
@@ -50,7 +57,12 @@ void saveConfig(const char* ssid, const char* pass, const char* server) {
 }
 
 bool connectWiFi() {
-    if (strlen(wifi_ssid) == 0) return false;
+    if (strlen(wifi_ssid) == 0) {
+        petState.setEmotion(PetEmotion::INIT, "No WiFi Config");
+        return false;
+    }
+    
+    petState.setEmotion(PetEmotion::THINKING, "Connecting WiFi...");
     WiFi.mode(WIFI_STA);
     WiFi.begin(wifi_ssid, wifi_pass);
     
@@ -60,6 +72,12 @@ bool connectWiFi() {
     }
     
     is_wifi_connected = (WiFi.status() == WL_CONNECTED);
+    if (is_wifi_connected) {
+        String ipStr = WiFi.localIP().toString();
+        petState.setEmotion(PetEmotion::HAPPY, ipStr.c_str());
+    } else {
+        petState.setEmotion(PetEmotion::SAD, "WiFi Fail");
+    }
     return is_wifi_connected;
 }
 
@@ -83,16 +101,33 @@ void handleJsonCommand(const char* payload) {
             } else {
                 pcTracker.clearSpotify();
             }
-        } else if (action == "speak") {
-            const char* emotion = doc["emotion"] | "talking";
+        } else if (action == "speak" || action == "set_emotion") {
+            const char* emotion = doc["emotion"] | "idle";
             const char* text = doc["text"] | "";
-            // map emotion string to enum (simplified)
-            PetEmotion emo = PetEmotion::TALKING;
+            PetEmotion emo = PetEmotion::IDLE;
             if (strcmp(emotion, "happy") == 0) emo = PetEmotion::HAPPY;
+            else if (strcmp(emotion, "angry") == 0) emo = PetEmotion::ANGRY;
+            else if (strcmp(emotion, "sleepy") == 0 || strcmp(emotion, "sleeping") == 0) emo = PetEmotion::SLEEPING;
+            else if (strcmp(emotion, "panic") == 0) emo = PetEmotion::PANIC;
+            else if (strcmp(emotion, "sad") == 0) emo = PetEmotion::SAD;
+            else if (strcmp(emotion, "love") == 0) emo = PetEmotion::LOVE;
+            else if (strcmp(emotion, "dizzy") == 0) emo = PetEmotion::DIZZY;
+            else if (strcmp(emotion, "talking") == 0) emo = PetEmotion::TALKING;
+            else if (strcmp(emotion, "listening") == 0) emo = PetEmotion::LISTENING;
+            else if (strcmp(emotion, "thinking") == 0) emo = PetEmotion::THINKING;
+            else if (strcmp(emotion, "party") == 0) emo = PetEmotion::PARTY;
+            else if (strcmp(emotion, "sweat") == 0) emo = PetEmotion::SWEAT;
+            else if (strcmp(emotion, "working") == 0) emo = PetEmotion::WORKING;
             petState.setEmotion(emo, text);
         } else if (action == "pomodoro") {
             int timeLeft = doc["time_left"] | 0;
             pcTracker.setPomodoro(timeLeft);
+        } else if (action == "set_rotation") {
+            int r = doc["rotation"] | 0;
+            M5.Display.setRotation(r);
+            preferences.begin("ai-companion", false);
+            preferences.putInt("rotation", r);
+            preferences.end();
         }
     }
 }
@@ -101,39 +136,150 @@ void webSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
     switch(type) {
         case WStype_DISCONNECTED:
             is_ws_connected = false;
+            petState.setEmotion(PetEmotion::SAD, "WS Reconnecting...");
             break;
         case WStype_CONNECTED:
             is_ws_connected = true;
-            petState.setEmotion(PetEmotion::HAPPY, "Connected");
+            petState.setEmotion(PetEmotion::HAPPY, "Online");
+            {
+                StaticJsonDocument<256> statusDoc;
+                statusDoc["action"] = "device_status";
+                statusDoc["device"] = "AtomS3";
+                statusDoc["ip"] = WiFi.localIP().toString();
+                statusDoc["ssid"] = WiFi.SSID();
+                statusDoc["rssi"] = WiFi.RSSI();
+                String statusStr;
+                serializeJson(statusDoc, statusStr);
+                webSocket.sendTXT(statusStr);
+                sendSerialData(0x01, (const uint8_t*)statusStr.c_str(), statusStr.length());
+            }
             break;
         case WStype_TEXT:
             handleJsonCommand((const char*)payload);
             break;
         case WStype_BIN:
-            petState.setEmotion(PetEmotion::TALKING);
+            lastAudioRxTime = millis();
+            if (petState.getEmotion() != PetEmotion::TALKING) {
+                petState.setEmotion(PetEmotion::TALKING);
+            }
             hardwareIO.playAudioStream(payload, length);
-            petState.setEmotion(PetEmotion::IDLE);
             break;
         default:
             break;
     }
 }
 
-// --- Serial JSON Handling ---
-void handleSerialJSON() {
-    if (!Serial.available()) return;
-    String input = Serial.readStringUntil('\n');
-    input.trim();
-    if (input.length() == 0) return;
-    
-    StaticJsonDocument<512> doc;
-    DeserializationError err = deserializeJson(doc, input);
-    if (!err) {
-        if (doc.containsKey("ssid")) {
-            saveConfig(doc["ssid"] | "", doc["pass"] | "", doc["server"] | server_ip);
-            ESP.restart();
-        } else {
-            handleJsonCommand(input.c_str());
+void sendSerialData(uint8_t type, const uint8_t* data, uint32_t length) {
+    if (!Serial) return;
+    uint8_t header[7];
+    header[0] = 0xAA;
+    header[1] = 0xBB;
+    header[2] = type;
+    header[3] = length & 0xFF;
+    header[4] = (length >> 8) & 0xFF;
+    header[5] = (length >> 16) & 0xFF;
+    header[6] = (length >> 24) & 0xFF;
+    Serial.write(header, 7);
+    Serial.write(data, length);
+}
+
+// --- Serial Protocol Handling ---
+void processSerial() {
+    static int state = 0;
+    static uint8_t msg_type = 0;
+    static uint32_t msg_length = 0;
+    static uint32_t bytes_read = 0;
+    static uint8_t* payload_buffer = nullptr;
+    static String text_buffer = ""; // For plain-text JSON fallback
+
+    while (Serial.available()) {
+        if (state == 0) { // Waiting for 0xAA or '{'
+            uint8_t b = Serial.read();
+            if (b == 0xAA) {
+                state = 1;
+            } else if (b == '{') {
+                // Legacy plain-text JSON started!
+                text_buffer = "{";
+                state = 10;
+            }
+        } else if (state == 10) { // Reading plain-text JSON until newline
+            char c = Serial.read();
+            if (c == '\n' || c == '\r') {
+                if (text_buffer.length() > 0) {
+                    StaticJsonDocument<512> doc;
+                    DeserializationError err = deserializeJson(doc, text_buffer);
+                    if (!err) {
+                        if (doc.containsKey("ssid")) {
+                            saveConfig(doc["ssid"] | "", doc["pass"] | "", doc["server"] | server_ip);
+                            ESP.restart();
+                        } else {
+                            handleJsonCommand(text_buffer.c_str());
+                        }
+                    }
+                }
+                text_buffer = "";
+                state = 0;
+            } else {
+                text_buffer += c;
+                if (text_buffer.length() > 512) state = 0; // Prevent overflow
+            }
+        } else if (state == 1) { // Waiting for 0xBB
+            if (Serial.read() == 0xBB) state = 2;
+            else state = 0;
+        } else if (state == 2) { // Read Type
+            msg_type = Serial.read();
+            state = 3;
+            bytes_read = 0;
+            msg_length = 0;
+        } else if (state == 3) { // Read Length (4 bytes, little endian)
+            msg_length |= (Serial.read() << (bytes_read * 8));
+            bytes_read++;
+            if (bytes_read == 4) {
+                if (msg_length > 0 && msg_length < 1000000) { // Sanity check
+                    payload_buffer = (uint8_t*)malloc(msg_length + 1);
+                    if (!payload_buffer) {
+                        state = 0; // OOM
+                    } else {
+                        state = 4;
+                        bytes_read = 0;
+                    }
+                } else {
+                    state = 0; // Invalid length
+                }
+            }
+        } else if (state == 4) { // Read Payload
+            int avail = Serial.available();
+            int to_read = msg_length - bytes_read;
+            if (avail > to_read) avail = to_read;
+            
+            Serial.readBytes(&payload_buffer[bytes_read], avail);
+            bytes_read += avail;
+            
+            if (bytes_read == msg_length) {
+                if (msg_type == 0x01) { // JSON
+                    payload_buffer[msg_length] = '\0'; // Null terminate string
+                    String input = String((char*)payload_buffer);
+                    StaticJsonDocument<512> doc;
+                    DeserializationError err = deserializeJson(doc, input);
+                    if (!err) {
+                        if (doc.containsKey("ssid")) {
+                            saveConfig(doc["ssid"] | "", doc["pass"] | "", doc["server"] | server_ip);
+                            ESP.restart();
+                        } else {
+                            handleJsonCommand(input.c_str());
+                        }
+                    }
+                } else if (msg_type == 0x02) { // Binary Audio
+                    lastAudioRxTime = millis();
+                    if (petState.getEmotion() != PetEmotion::TALKING) {
+                        petState.setEmotion(PetEmotion::TALKING);
+                    }
+                    hardwareIO.playAudioStream(payload_buffer, msg_length);
+                }
+                free(payload_buffer);
+                payload_buffer = nullptr;
+                state = 0;
+            }
         }
     }
 }
@@ -173,6 +319,7 @@ void setup() {
         webSocket.begin(server_ip, websocket_port, websocket_path);
         webSocket.onEvent(webSocketEvent);
         webSocket.setReconnectInterval(5000);
+        hardwareIO.startRecording(); // Start continuous recording
     }
     
     // Create Render Task on Core 0 (App core is 1, PRO core is 0)
@@ -195,22 +342,50 @@ void loop() {
     
     if (is_wifi_connected) {
         webSocket.loop();
+    } else {
+        // Fallback: If WiFi fails but we are connected via USB, start recording anyway
+        if (!hardwareIO.isRecording() && Serial) {
+            hardwareIO.startRecording();
+            petState.setEmotion(PetEmotion::HAPPY, "USB Connected");
+        }
     }
     
-    handleSerialJSON();
+    processSerial();
     
-    // Handle microphone recording finish
-    static bool wasRecording = false;
-    if (hardwareIO.isRecording()) {
-        wasRecording = true;
-    } else if (wasRecording) {
-        // Just stopped recording
-        wasRecording = false;
+    // Auto-detect end of audio playback (no audio chunks for 350ms)
+    if (petState.getEmotion() == PetEmotion::TALKING && millis() - lastAudioRxTime > 350) {
+        hardwareIO.stopAudioPlayback(); // Zero out DMA buffer to eliminate repeating noise
+        hardwareIO.resetRecordBuffer(); // Flush mic buffer recorded during speech
+        petState.setEmotion(PetEmotion::LISTENING, "Listening...");
+    }
+
+    // Handle continuous audio streaming
+    if (hardwareIO.isRecording() && hardwareIO.hasAudioChunk() && petState.getEmotion() != PetEmotion::TALKING) {
         size_t len = hardwareIO.getRecordSize();
-        if (len > 0 && is_ws_connected) {
-            webSocket.sendBIN(hardwareIO.getRecordBuffer(), len);
+        if (len > 0) {
+            if (is_ws_connected) {
+                webSocket.sendBIN(hardwareIO.getRecordBuffer(), len);
+            }
+            sendSerialData(0x02, hardwareIO.getRecordBuffer(), len);
         }
         hardwareIO.resetRecordBuffer();
+    }
+    
+    // Handle shake events -> notify backend
+    static bool wasShaking = false;
+    if (hardwareIO.isShaking()) {
+        if (!wasShaking) {
+            wasShaking = true;
+            StaticJsonDocument<128> shakeDoc;
+            shakeDoc["action"] = "shake";
+            shakeDoc["count"] = hardwareIO.getShakeCount();
+            String shakeStr;
+            serializeJson(shakeDoc, shakeStr);
+            if (is_ws_connected) webSocket.sendTXT(shakeStr);
+            sendSerialData(0x01, (const uint8_t*)shakeStr.c_str(), shakeStr.length());
+        }
+    } else {
+        wasShaking = false;
     }
     
     // Don't starve watchdog
