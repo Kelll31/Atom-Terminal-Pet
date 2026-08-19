@@ -1,0 +1,21 @@
+{
+  "api_key": "",
+  "base_url": "https://api.deepseek.com/v1",
+  "model_name": "deepseek-chat",
+  "temperature": 0.4,
+  "max_steps": 12,
+
+  "pet_name": "Атом",
+  "wake_words": ["атом", "atom", "автом", "а том", "отом"],
+  "require_wake_word": true,
+  "speak_replies": true,
+  "max_speech_chars": 400,
+
+  "autonomy": "auto_safe",
+  "approval_timeout_sec": 180,
+  "allowed_roots": ["C:/Users/USERNAME/Documents", "D:/projects"],
+  "disabled_tools": [],
+  "command_timeout_sec": 120,
+
+  "mcp_enabled": true
+}

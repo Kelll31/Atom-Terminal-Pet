@@ -18,6 +18,10 @@ class SerialManager:
         self.on_json_message = None
         self.on_binary_message = None
 
+    @property
+    def is_connected(self) -> bool:
+        return bool(self.ser and self.ser.is_open)
+
     def find_m5stack_port(self):
         # M5Stack AtomS3 Native USB VID is 0x303A (Espressif)
         ports = serial.tools.list_ports.comports()
@@ -43,7 +47,9 @@ class SerialManager:
             self.ser.port = port
             self.ser.baudrate = 115200
             self.ser.timeout = 0.1
-            self.ser.write_timeout = 0.1
+            # Аудио идёт кусками по 4 КБ: при коротком таймауте записи чанки
+            # молча терялись и речь на динамике рвалась.
+            self.ser.write_timeout = 2.0
             
             # Windows native USB CDC workarounds
             self.ser.dtr = True
@@ -81,16 +87,23 @@ class SerialManager:
             if "PermissionError" in str(e) or "OSError" in str(e):
                 self.ser.close() # Force close so it reconnects
 
-    def send_binary(self, data: bytes):
+    def send_binary(self, data: bytes) -> bool:
         if not self.ser or not self.ser.is_open:
-            return
+            return False
         try:
             header = struct.pack('<BBBI', 0xAA, 0xBB, 0x02, len(data))
             self.ser.write(header + data)
+            return True
+        except serial.SerialTimeoutException:
+            # Устройство не успевает забирать данные — чанк пропускаем,
+            # но порт не рвём: следующий уйдёт нормально.
+            logger.warning("Устройство не успело принять аудио-чанк, пропускаю")
+            return False
         except Exception as e:
-            logger.error(f"Error sending binary over Serial: {e}")
+            logger.error(f"Ошибка отправки аудио в Serial: {e}")
             if "PermissionError" in str(e) or "OSError" in str(e):
                 self.ser.close()
+            return False
 
     async def read_loop(self):
         while self.running:

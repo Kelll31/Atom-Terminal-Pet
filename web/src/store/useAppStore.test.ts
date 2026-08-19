@@ -1,45 +1,86 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 import { useAppStore } from './useAppStore';
+import type { Approval, Task } from './useAppStore';
+
+const makeTask = (overrides: Partial<Task> = {}): Task => ({
+  id: 't1',
+  text: 'Проверь диск',
+  title: 'Проверь диск',
+  source: 'chat',
+  status: 'running',
+  steps: [],
+  result: '',
+  error: '',
+  created: Date.now() / 1000,
+  finished: null,
+  duration: 0,
+  ...overrides,
+});
 
 describe('useAppStore', () => {
   beforeEach(() => {
-    // Reset store state
     useAppStore.setState({
       isConnected: false,
-      metrics: { cpu: 0, ram: 0, gpu: 0, temp: 0, spotify: 'Nothing' },
       emotion: 'idle',
-      deviceStatus: {
-        connected: false,
-        ip: 'Offline',
-        ssid: 'Disconnected',
-        rssi: 0,
-        device: 'M5Stack AtomS3',
-        last_seen: null,
-      },
       logs: [],
+      tasks: [],
+      approvals: [],
+      chatHistory: [],
+      agentStatus: { state: 'idle' },
     });
   });
 
-  it('adds log messages and limits to 50', () => {
-    const store = useAppStore.getState();
-    expect(store.logs).toHaveLength(0);
+  it('хранит последние 200 записей журнала', () => {
+    for (let i = 0; i < 260; i++) useAppStore.getState().addLog(`Строка ${i}`);
 
-    // Add 60 logs
-    for (let i = 0; i < 60; i++) {
-      useAppStore.getState().addLog(`Log ${i}`);
-    }
-
-    const updatedStore = useAppStore.getState();
-    expect(updatedStore.logs).toHaveLength(50);
-    expect(updatedStore.logs[0]).toBe('Log 10');
-    expect(updatedStore.logs[49]).toBe('Log 59');
+    const { logs } = useAppStore.getState();
+    expect(logs).toHaveLength(200);
+    expect(logs[logs.length - 1]).toContain('Строка 259');
   });
 
-  it('sets emotion', () => {
-    const store = useAppStore.getState();
-    expect(store.emotion).toBe('idle');
+  it('приводит sleeping к sleepy, чтобы совпадать с прошивкой', () => {
+    useAppStore.getState().setEmotion('sleeping');
+    expect(useAppStore.getState().emotion).toBe('sleepy');
+  });
 
-    store.setEmotion('happy');
-    expect(useAppStore.getState().emotion).toBe('happy');
+  it('добавляет сообщение пользователя в историю при постановке задачи', () => {
+    useAppStore.getState().sendTask('  проверь git  ');
+    const { chatHistory } = useAppStore.getState();
+    expect(chatHistory).toHaveLength(1);
+    expect(chatHistory[0]).toMatchObject({ sender: 'user', text: 'проверь git' });
+  });
+
+  it('игнорирует пустую задачу', () => {
+    useAppStore.getState().sendTask('   ');
+    expect(useAppStore.getState().chatHistory).toHaveLength(0);
+  });
+
+  it('убирает подтверждение из очереди после решения', () => {
+    const approval: Approval = {
+      id: 'a1',
+      task_id: 't1',
+      task_title: 'Удалить файл',
+      tool: 'delete_path',
+      args: { path: 'D:/tmp/x' },
+      risk: 'danger',
+      description: 'Удаляет файл',
+      created: 0,
+    };
+    useAppStore.setState({ approvals: [approval] });
+
+    useAppStore.getState().resolveApproval('a1', 'allow');
+    expect(useAppStore.getState().approvals).toHaveLength(0);
+  });
+
+  it('обновляет задачу по идентификатору, а не дублирует её', () => {
+    const task = makeTask();
+    useAppStore.setState({ tasks: [task] });
+    useAppStore.setState({
+      tasks: useAppStore.getState().tasks.map(t => (t.id === task.id ? { ...t, status: 'done' } : t)),
+    });
+
+    const { tasks } = useAppStore.getState();
+    expect(tasks).toHaveLength(1);
+    expect(tasks[0].status).toBe('done');
   });
 });

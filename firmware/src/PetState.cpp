@@ -10,11 +10,12 @@ PetState::PetState() {
     attentionLevel = 50;
 }
 
-void PetState::setEmotion(PetEmotion emotion, const char* text) {
+void PetState::setEmotion(PetEmotion emotion, const char* text, uint32_t holdMs) {
     if (currentEmotion != emotion) {
         currentEmotion = emotion;
         stateStartTime = millis();
     }
+    holdUntil = (holdMs > 0) ? (millis() + holdMs) : 0;
     if (text) {
         emotionText = text;
     } else {

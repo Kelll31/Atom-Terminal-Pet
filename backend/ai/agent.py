@@ -1,232 +1,240 @@
+"""Агент Атома: цикл «модель ↔ инструменты».
+
+Модель получает список инструментов (локальные + MCP) и сама решает, что вызвать.
+Каждый вызов проходит через реестр: проверка прав, подтверждение опасных действий,
+запись в журнал. Все шаги транслируются в web-панель, поэтому пользователь видит,
+что именно делает питомец.
+"""
+
+from __future__ import annotations
+
+import json
 import logging
-import operator
-from collections.abc import Sequence
-from typing import Annotated, Literal, TypedDict
+import os
+from collections import deque
+from typing import Any
 
-from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
-from langgraph.graph import END, StateGraph
 import yaml
-from core.mcp_client import mcp_manager
-from mcp_tools import get_active_tools
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
 
-# from langchain_openai import ChatOpenAI
-from langchain_openai import ChatOpenAI
-from monitor.pc_monitor import pc_monitor
+from ai.tools import registry
+from ai.tools.productivity import load_memory_digest
+from core.settings import settings_store
 
 logger = logging.getLogger("ai.agent")
 
+BACKEND_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+PROMPTS_FILE = os.path.join(BACKEND_DIR, "config", "prompts.yaml")
 
-# 1. Define State
-class AgentState(TypedDict):
-    messages: Annotated[Sequence[BaseMessage], operator.add]
-    pc_context: dict  # Snapshot of current PC metrics
-    next_action: str
+FALLBACK_PROMPT = (
+    "Ты — {pet_name}, кибер-питомец и помощник программиста, живущий в M5Stack AtomS3R. "
+    "Отвечай коротко и по делу на русском языке."
+)
 
-
-# 2. Define Nodes
-async def analyze_intent(state: AgentState) -> dict:
-    """Analyze the user's input and decide whether to use a tool or just respond."""
-    logger.info("Node: analyze_intent")
-    messages = state["messages"]
-    last_msg = messages[-1].content
-
-    # In a real app, an LLM call here would determine intent
-    # Example logic: if "search" in last_msg, use tool.
-    if (
-        "открой" in last_msg.lower()
-        or "найди" in last_msg.lower()
-        or "напомни" in last_msg.lower()
-    ):
-        return {"next_action": "execute_tool"}
-
-    return {"next_action": "generate_response"}
-
-
-async def execute_tool(state: AgentState) -> dict:
-    """Execute a local PC tool (mcp_tools)"""
-    logger.info("Node: execute_tool")
-    # Execute tool logic here (e.g. opening a program)
-    tool_result = "Tool executed successfully."
-
-    # Append tool result to messages so LLM knows it was done
-    return {
-        "messages": [SystemMessage(content=f"Tool Result: {tool_result}")],
-        "next_action": "generate_response",
-    }
-
-
-import json
-import os
-
-SETTINGS_FILE = os.path.join(
-    os.path.dirname(os.path.dirname(__file__)), "settings.json"
+NO_KEY_MESSAGE = (
+    "Мозг не подключён: не задан API-ключ модели. Открой web-панель, вкладка «Настройки», "
+    "укажи ключ и модель — и я снова смогу думать."
 )
 
 
-def get_pet_name():
-    if os.path.exists(SETTINGS_FILE):
+class AgentUnavailable(Exception):
+    """Агент не может работать (нет ключа/модели)."""
+
+
+def load_system_prompt(pc_context: dict[str, Any]) -> str:
+    settings = settings_store.current
+    template = FALLBACK_PROMPT
+    if os.path.exists(PROMPTS_FILE):
         try:
-            with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                return data.get("pet_name", "Атом")
-        except Exception:
-            pass
-    return "Атом"
-
-
-async def generate_response(state: AgentState) -> dict:
-    """Generate the final response string using an LLM, given the PC context."""
-    logger.info("Node: generate_response")
-
-    pc_ctx = state.get("pc_context", {})
-    # Load system prompt from config
-    prompt_file = os.path.join(os.path.dirname(os.path.dirname(__file__)), "config", "prompts.yaml")
-    sys_prompt = "You are a helpful AI."
-    if os.path.exists(prompt_file):
-        try:
-            with open(prompt_file, "r", encoding="utf-8") as f:
-                prompt_data = yaml.safe_load(f)
-                sys_prompt = prompt_data.get("system_prompt", sys_prompt)
+            with open(PROMPTS_FILE, "r", encoding="utf-8") as f:
+                data = yaml.safe_load(f) or {}
+                template = data.get("system_prompt", template)
         except Exception as e:
-            logger.error(f"Failed to load prompts.yaml: {e}")
+            logger.error(f"Не удалось прочитать prompts.yaml: {e}")
 
-    # Inject variables
-    sys_prompt = sys_prompt.format(
-        cpu=pc_ctx.get("cpu", 0),
-        ram=pc_ctx.get("ram", 0),
-        gpu=pc_ctx.get("gpu", 0),
-        temp=pc_ctx.get("temp", 0)
+    prompt = template.format(
+        pet_name=settings.pet_name,
+        cpu=pc_context.get("cpu", 0),
+        ram=pc_context.get("ram", 0),
+        gpu=pc_context.get("gpu", 0),
+        temp=pc_context.get("temp", 0),
+        media=pc_context.get("spotify", "ничего"),
     )
 
-    settings = {}
-    if os.path.exists(SETTINGS_FILE):
-        try:
-            with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
-                settings = json.load(f)
-        except Exception:
-            pass
+    autonomy_note = {
+        "ask": "Каждое действие, меняющее систему, пользователь подтверждает вручную — предупреждай об этом.",
+        "auto_safe": "Безопасные инструменты ты применяешь сам, опасные (запись файлов, команды, kill) пользователь подтверждает.",
+        "full": "Тебе разрешено выполнять любые инструменты без подтверждения. Будь предельно аккуратен.",
+    }[settings.autonomy]
 
-    api_key = settings.get("api_key")
-    if api_key:
-        try:
-            headers = {}
-            base_url = settings.get("base_url")
-            if base_url and "openrouter.ai" in base_url.lower():
-                headers = {
-                    "HTTP-Referer": "http://localhost:8000",
-                    "X-Title": "Atom-Terminal-Pet"
-                }
+    parts = [prompt, "", f"РЕЖИМ АВТОНОМИИ: {autonomy_note}"]
 
-            llm = ChatOpenAI(
-                api_key=api_key,
-                base_url=base_url or None,
-                model=settings.get("model_name") or "gpt-3.5-turbo",
-                default_headers=headers
-            )
-            
-            # Bind tools
-            all_tools = get_active_tools() + mcp_manager.langchain_tools
-            if all_tools:
-                llm = llm.bind_tools(all_tools)
-
-            # Make sure we only pass the most recent messages to prevent context overflow
-            messages_to_send = [SystemMessage(content=sys_prompt)] + list(state['messages'])[-5:]
-            response = await llm.ainvoke(messages_to_send)
-            return {"messages": [AIMessage(content=response.content)]}
-        except Exception as e:
-            logger.error(f"LLM Error: {e}")
-            # Fallback to mock if API fails
-
-    last_user_msg = state["messages"][0].content if state["messages"] else ""
-    msg_lower = last_user_msg.lower()
-
-    pet_name = get_pet_name()
-    pet_name_lower = pet_name.lower()
-
-    # Check for wake word / pet name calls
-    if any(
-        name in msg_lower
-        for name in [pet_name_lower, "атом", "atom", "петя", "pet", "микро", "micro"]
-    ):
-        bot_name = (
-            pet_name
-            if pet_name_lower in msg_lower
-            else ("Микро" if "микро" in msg_lower or "micro" in msg_lower else "Атом")
-        )
-        if "как дела" in msg_lower or "как ты" in msg_lower:
-            response_text = f"{bot_name} на связи! Отлично себя чувствую, системные показатели в норме!"
-        elif "кто ты" in msg_lower or "как тебя зовут" in msg_lower:
-            response_text = f"Привет! Я {bot_name} — твой верный ИИ-питомец и помощник!"
-        else:
-            response_text = f"Да! {bot_name} на связи! Я готов к работе."
-    elif "лагает" in msg_lower and pc_ctx.get("cpu", 0) > 80:
-        response_text = (
-            "Твой процессор загружен почти на сотку! Давай закроем лишние вкладки?"
-        )
+    roots = settings.allowed_roots
+    if roots:
+        parts.append("Доступные каталоги для файловых операций: " + "; ".join(roots))
     else:
-        response_text = "Я тебя понял! Все системы работают в штатном режиме."
+        parts.append("Файловые инструменты пока недоступны: пользователь не выбрал рабочие каталоги.")
 
-    return {"messages": [AIMessage(content=response_text)]}
+    memory = load_memory_digest()
+    if memory:
+        parts.append("\nЧТО ТЫ ПОМНИШЬ О ПОЛЬЗОВАТЕЛЕ:\n" + memory)
 
-
-# 3. Define routing function
-def route_action(state: AgentState) -> Literal["execute_tool", "generate_response"]:
-    if state.get("next_action") == "execute_tool":
-        return "execute_tool"
-    return "generate_response"
-
-
-# 4. Build Graph
-workflow = StateGraph(AgentState)
-
-workflow.add_node("analyze_intent", analyze_intent)
-workflow.add_node("execute_tool", execute_tool)
-workflow.add_node("generate_response", generate_response)
-
-workflow.set_entry_point("analyze_intent")
-
-workflow.add_conditional_edges(
-    "analyze_intent",
-    route_action,
-    {"execute_tool": "execute_tool", "generate_response": "generate_response"},
-)
-workflow.add_edge("execute_tool", "generate_response")
-workflow.add_edge("generate_response", END)
-
-app_graph = workflow.compile()
+    parts.append(
+        "\nПРАВИЛА РАБОТЫ С ИНСТРУМЕНТАМИ:\n"
+        "- Если задачу можно выполнить инструментом — выполняй, а не рассказывай, как её сделать.\n"
+        "- Сначала собери факты (get_pc_status, list_dir, read_file, git_status), потом действуй.\n"
+        "- Опасные действия описывай пользователю до вызова: он увидит запрос подтверждения.\n"
+        "- Не выдумывай результат инструмента. Если инструмент вернул ошибку — честно скажи об этом.\n"
+        "- Итоговый ответ — короткий (1-3 предложения), без эмодзи и Markdown: его читает синтезатор речи."
+    )
+    return "\n".join(parts)
 
 
-async def process_user_input(text: str) -> str | None:
-    """Entry point for the backend to pass STT text into the agent."""
-    
-    # Wake word check
-    msg_lower = text.lower()
-    pet_name_lower = get_pet_name().lower()
-    wake_words = [pet_name_lower, "атом", "atom", "петя", "pet", "микро", "micro", "а там", "о том", "потом"]
-    
-    if not any(w in msg_lower for w in wake_words):
-        logger.info(f"Ignored speech (no wake word): {text}")
-        return None
+def build_llm(with_tools: bool = True):
+    from langchain_openai import ChatOpenAI
 
-    # Capture current PC state from monitor
-    current_metrics = {
-        "cpu": pc_monitor.get_gpu_usage(),  # using as placeholder
-        "ram": 50,
-        "gpu": 10,
-        "temp": pc_monitor.get_cpu_temp(),
-        "spotify": "None",
-    }
+    settings = settings_store.current
+    if not settings.api_key:
+        raise AgentUnavailable(NO_KEY_MESSAGE)
 
-    # We could await collect_metrics, but it's fine to fetch latest known state
-    state_input = {
-        "messages": [HumanMessage(content=text)],
-        "pc_context": current_metrics,
-        "next_action": "",
-    }
+    headers = {}
+    if settings.base_url and "openrouter.ai" in settings.base_url.lower():
+        headers = {"HTTP-Referer": "http://localhost:8000", "X-Title": "Atom-Terminal-Pet"}
 
-    # Run graph
-    result = await app_graph.ainvoke(state_input)
+    llm = ChatOpenAI(
+        api_key=settings.api_key,
+        base_url=settings.base_url or None,
+        model=settings.model_name or "gpt-4o-mini",
+        temperature=settings.temperature,
+        timeout=90,
+        max_retries=2,
+        default_headers=headers,
+    )
 
-    # Extract final AIMessage
-    final_message = result["messages"][-1].content
-    return final_message
+    if with_tools:
+        schemas = registry.openai_schemas(settings.disabled_tools)
+        if schemas:
+            llm = llm.bind_tools(schemas)
+    return llm
+
+
+class AtomAgent:
+    """Хранит историю диалога и выполняет задачи."""
+
+    def __init__(self, history_limit: int = 16) -> None:
+        self.history: deque[BaseMessage] = deque(maxlen=history_limit)
+
+    def reset(self) -> None:
+        self.history.clear()
+
+    async def run(self, user_text: str, ctx: Any) -> str:
+        """Выполняет задачу пользователя. ctx — контекст задачи (шаги, подтверждения)."""
+        from monitor.pc_monitor import pc_monitor
+
+        settings = settings_store.current
+        pc_context = pc_monitor.latest_metrics()
+        llm = build_llm(with_tools=True)
+
+        messages: list[BaseMessage] = [SystemMessage(content=load_system_prompt(pc_context))]
+        messages.extend(self.history)
+        messages.append(HumanMessage(content=user_text))
+
+        final_text = ""
+        for step in range(settings.max_steps):
+            await ctx.emit("agent_status", state="thinking", step=step + 1)
+
+            try:
+                ai_msg: AIMessage = await llm.ainvoke(messages)
+            except Exception as e:  # noqa: BLE001
+                logger.error(f"Ошибка обращения к модели: {e}")
+                raise AgentUnavailable(f"Модель недоступна: {e}") from e
+
+            messages.append(ai_msg)
+            tool_calls = getattr(ai_msg, "tool_calls", None) or []
+
+            if not tool_calls:
+                final_text = self._text_of(ai_msg)
+                break
+
+            if isinstance(ai_msg.content, str) and ai_msg.content.strip():
+                await ctx.add_step("thought", text=ai_msg.content.strip())
+
+            for call in tool_calls:
+                name = call.get("name", "")
+                args = call.get("args", {}) or {}
+                call_id = call.get("id") or name
+
+                await ctx.emit("agent_status", state="working", tool=name)
+                step_id = await ctx.add_step("tool_call", tool=name, args=args)
+
+                ok, result = await registry.execute(
+                    name,
+                    args,
+                    ctx=ctx,
+                    autonomy=settings.autonomy,
+                    disabled=settings.disabled_tools,
+                )
+                await ctx.add_step("tool_result", tool=name, ok=ok, result=result, parent=step_id)
+                messages.append(ToolMessage(content=result, tool_call_id=call_id, name=name))
+        else:
+            final_text = (
+                "Я сделал что мог, но задача оказалась слишком длинной — "
+                "остановился на лимите шагов. Скажи, что делать дальше."
+            )
+
+        if not final_text:
+            final_text = "Готово."
+
+        self.history.append(HumanMessage(content=user_text))
+        self.history.append(AIMessage(content=final_text))
+        return final_text
+
+    @staticmethod
+    def _text_of(message: AIMessage) -> str:
+        content = message.content
+        if isinstance(content, str):
+            return content.strip()
+        if isinstance(content, list):  # некоторые провайдеры отдают блоки
+            parts = [
+                block.get("text", "")
+                for block in content
+                if isinstance(block, dict) and block.get("type") == "text"
+            ]
+            return "\n".join(p for p in parts if p).strip()
+        return str(content or "").strip()
+
+
+agent = AtomAgent()
+
+
+def is_wake_word_present(text: str) -> bool:
+    """Проверка обращения к питомцу по имени (только для голосового ввода)."""
+    settings = settings_store.current
+    if not settings.require_wake_word:
+        return True
+    lowered = text.lower()
+    words = set(settings.wake_words) | {settings.pet_name.lower()}
+    return any(word and word in lowered for word in words)
+
+
+async def quick_reply(text: str) -> str:
+    """Ответ без инструментов — используется для быстрых реплик и тестов связи."""
+    llm = build_llm(with_tools=False)
+    response = await llm.ainvoke(
+        [SystemMessage(content=load_system_prompt({})), HumanMessage(content=text)]
+    )
+    return AtomAgent._text_of(response)
+
+
+def tools_snapshot() -> list[dict[str, Any]]:
+    disabled = set(settings_store.get("disabled_tools") or [])
+    snapshot = []
+    for spec in registry.all():
+        info = spec.info()
+        info["enabled"] = info["enabled"] and spec.name not in disabled
+        snapshot.append(info)
+    return sorted(snapshot, key=lambda s: (s["category"], s["name"]))
+
+
+def describe_tools_for_log() -> str:
+    return json.dumps(tools_snapshot(), ensure_ascii=False, indent=2)

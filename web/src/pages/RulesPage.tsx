@@ -1,5 +1,6 @@
-import React, { useState, useEffect } from 'react';
-import { Settings2, Plus, Trash2, Save, Activity, Zap } from 'lucide-react';
+import React, { useEffect, useState } from 'react';
+import { Activity, CheckCircle2, Plus, Save, SlidersHorizontal, Trash2, Zap } from 'lucide-react';
+import { API_BASE } from '../config';
 
 interface Rule {
   id: string;
@@ -11,224 +12,226 @@ interface Rule {
     duration_seconds: number;
   };
   action: {
-    type: string;
+    type: 'set_emotion' | 'speak' | 'agent_task';
     emotion: string;
     text: string;
+    task?: string;
   };
+  cooldown_seconds: number;
 }
+
+const METRICS = [
+  { value: 'cpu', label: 'Загрузка CPU, %' },
+  { value: 'ram', label: 'Загрузка RAM, %' },
+  { value: 'gpu', label: 'Загрузка GPU, %' },
+  { value: 'temp', label: 'Температура, °C' },
+];
+
+const EMOTIONS = ['idle', 'happy', 'angry', 'sad', 'love', 'dizzy', 'sleepy', 'working', 'thinking', 'panic', 'sweat', 'party'];
+
+const ACTION_TYPES = [
+  { value: 'set_emotion', label: 'Показать эмоцию' },
+  { value: 'speak', label: 'Сказать вслух' },
+  { value: 'agent_task', label: 'Поставить задачу агенту' },
+];
 
 const RulesPage: React.FC = () => {
   const [rules, setRules] = useState<Rule[]>([]);
-  const [isLoading, setIsLoading] = useState(true);
-  const [isSaving, setIsSaving] = useState(false);
+  const [loading, setLoading] = useState(true);
+  const [status, setStatus] = useState('');
 
   useEffect(() => {
-    fetchRules();
+    fetch(`${API_BASE}/api/rules`)
+      .then(res => res.json())
+      .then(data => setRules(data.rules ?? []))
+      .catch(() => setStatus('Не удалось загрузить правила.'))
+      .finally(() => setLoading(false));
   }, []);
 
-  const fetchRules = async () => {
+  const save = async () => {
+    setStatus('Сохраняю…');
     try {
-      const res = await fetch('http://localhost:8000/api/rules');
-      const data = await res.json();
-      setRules(data.rules || []);
-    } catch (e) {
-      console.error("Failed to fetch rules", e);
-    } finally {
-      setIsLoading(false);
-    }
-  };
-
-  const handleSave = async () => {
-    setIsSaving(true);
-    try {
-      await fetch('http://localhost:8000/api/rules', {
+      const res = await fetch(`${API_BASE}/api/rules`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ rules })
+        body: JSON.stringify({ rules }),
       });
-      alert('Rules saved and applied successfully!');
-    } catch (e) {
-      console.error("Failed to save rules", e);
-      alert('Failed to save rules.');
-    } finally {
-      setIsSaving(false);
+      const data = await res.json();
+      setStatus(`Сохранено, правил активно: ${data.count ?? rules.length}`);
+    } catch (error) {
+      setStatus(`Ошибка сохранения: ${error}`);
     }
   };
 
-  const addRule = () => {
-    const newRule: Rule = {
-      id: `rule_${Date.now()}`,
-      description: "New Rule",
-      condition: { metric: "cpu", operator: ">", value: 80, duration_seconds: 5 },
-      action: { type: "set_emotion", emotion: "angry", text: "Too much CPU!" }
-    };
-    setRules([...rules, newRule]);
+  const update = (id: string, path: string, value: unknown) => {
+    setRules(current =>
+      current.map(rule => {
+        if (rule.id !== id) return rule;
+        const [head, tail] = path.split('.');
+        if (!tail) return { ...rule, [head]: value } as Rule;
+        return { ...rule, [head]: { ...(rule as any)[head], [tail]: value } } as Rule;
+      }),
+    );
   };
 
-  const removeRule = (id: string) => {
-    setRules(rules.filter(r => r.id !== id));
-  };
+  const addRule = () =>
+    setRules(current => [
+      ...current,
+      {
+        id: `rule_${Date.now()}`,
+        description: 'Новое правило',
+        condition: { metric: 'cpu', operator: '>', value: 85, duration_seconds: 30 },
+        action: { type: 'set_emotion', emotion: 'panic', text: 'CPU!' },
+        cooldown_seconds: 600,
+      },
+    ]);
 
-  const updateRule = (id: string, field: string, value: any) => {
-    setRules(rules.map(r => {
-      if (r.id !== id) return r;
-      const parts = field.split('.');
-      if (parts.length === 1) {
-        return { ...r, [field]: value };
-      } else {
-        return {
-          ...r,
-          [parts[0]]: {
-            ...(r as any)[parts[0]],
-            [parts[1]]: value
-          }
-        };
-      }
-    }));
-  };
-
-  if (isLoading) return <div className="p-8 text-center text-cyber-cyan">Loading rules...</div>;
+  if (loading) return <div className="p-8 text-sm text-slate-400">Загружаю правила…</div>;
 
   return (
-    <div className="flex-1 p-8 max-w-5xl mx-auto w-full animate-fade-in space-y-8">
-      
-      <div className="flex justify-between items-center">
+    <div className="animate-fade-in mx-auto w-full max-w-5xl space-y-6 p-4 md:p-6">
+      <header className="flex flex-wrap items-start justify-between gap-4">
         <div>
-          <h2 className="text-3xl font-bold flex items-center gap-2">
-            <Settings2 className="w-8 h-8 text-cyber-cyan" />
-            Rule Configurator
-          </h2>
-          <p className="text-gray-400 mt-2">Visually edit triggers and reactions.</p>
+          <h1 className="flex items-center gap-2 text-2xl font-bold text-white">
+            <SlidersHorizontal className="h-6 w-6 text-cyber-cyan" /> Правила поведения
+          </h1>
+          <p className="mt-1 text-sm text-slate-400">
+            Питомец сам реагирует на состояние компьютера: меняет настроение, говорит или берётся за задачу.
+          </p>
         </div>
-        <button 
-          onClick={handleSave}
-          disabled={isSaving}
-          className="flex items-center gap-2 px-6 py-3 bg-cyber-emerald/20 text-cyber-emerald border border-cyber-emerald rounded-lg hover:bg-cyber-emerald/30 transition-colors"
-        >
-          <Save className="w-5 h-5" />
-          {isSaving ? 'Saving...' : 'Save & Deploy'}
+        <button onClick={save} className="btn-primary">
+          <Save className="h-4 w-4" /> Сохранить и применить
         </button>
-      </div>
+      </header>
 
-      <div className="space-y-6">
-        {rules.map((rule) => (
-          <div key={rule.id} className="bg-cyber-navy/40 border border-cyber-navy p-6 rounded-xl relative group">
-            
-            <button 
-              onClick={() => removeRule(rule.id)}
-              className="absolute top-4 right-4 p-2 text-gray-500 hover:text-red-500 opacity-0 group-hover:opacity-100 transition-opacity"
-            >
-              <Trash2 className="w-5 h-5" />
-            </button>
+      {status && (
+        <div className="card flex items-center gap-2 p-3 text-sm text-slate-200">
+          <CheckCircle2 className="h-4 w-4 text-cyber-cyan" /> {status}
+        </div>
+      )}
 
-            <div className="mb-4">
-              <input 
-                type="text" 
+      <div className="space-y-4">
+        {rules.map(rule => (
+          <div key={rule.id} className="card space-y-4 p-5">
+            <div className="flex items-center gap-3">
+              <input
                 value={rule.description}
-                onChange={(e) => updateRule(rule.id, 'description', e.target.value)}
-                className="bg-transparent text-xl font-bold text-white border-b border-transparent hover:border-cyber-cyan focus:border-cyber-cyan outline-none transition-colors w-2/3"
+                onChange={e => update(rule.id, 'description', e.target.value)}
+                className="flex-1 border-b border-transparent bg-transparent text-lg font-semibold text-white outline-none transition-colors focus:border-cyber-cyan"
               />
+              <button
+                onClick={() => setRules(current => current.filter(r => r.id !== rule.id))}
+                className="text-slate-500 transition-colors hover:text-red-300"
+              >
+                <Trash2 className="h-4 w-4" />
+              </button>
             </div>
 
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-8 bg-cyber-dark/50 p-4 rounded-lg border border-gray-800">
-              
-              {/* IF Condition */}
-              <div className="space-y-4">
-                <h3 className="text-sm font-bold text-cyber-cyan uppercase tracking-wider flex items-center gap-2">
-                  <Activity className="w-4 h-4" />
-                  IF (Condition)
+            <div className="grid gap-5 rounded-xl border border-white/5 bg-black/25 p-4 md:grid-cols-2">
+              <div className="space-y-3">
+                <h3 className="flex items-center gap-2 text-xs font-bold uppercase tracking-wider text-cyber-cyan">
+                  <Activity className="h-4 w-4" /> Если
                 </h3>
-                
-                <div className="flex items-center gap-3">
-                  <select 
+                <div className="flex flex-wrap items-center gap-2">
+                  <select
                     value={rule.condition.metric}
-                    onChange={(e) => updateRule(rule.id, 'condition.metric', e.target.value)}
-                    className="bg-cyber-navy border border-gray-700 text-white rounded p-2 outline-none focus:border-cyber-cyan"
+                    onChange={e => update(rule.id, 'condition.metric', e.target.value)}
+                    className="field w-auto"
                   >
-                    <option value="cpu">CPU Usage (%)</option>
-                    <option value="ram">RAM Usage (%)</option>
-                    <option value="temp">CPU Temp (°C)</option>
+                    {METRICS.map(metric => (
+                      <option key={metric.value} value={metric.value} className="bg-cyber-dark">
+                        {metric.label}
+                      </option>
+                    ))}
                   </select>
-
-                  <select 
+                  <select
                     value={rule.condition.operator}
-                    onChange={(e) => updateRule(rule.id, 'condition.operator', e.target.value)}
-                    className="bg-cyber-navy border border-gray-700 text-white rounded p-2 outline-none focus:border-cyber-cyan"
+                    onChange={e => update(rule.id, 'condition.operator', e.target.value)}
+                    className="field w-16"
                   >
-                    <option value=">">&gt;</option>
-                    <option value="<">&lt;</option>
-                    <option value="==">==</option>
+                    {['>', '<', '>=', '<=', '=='].map(op => (
+                      <option key={op} value={op} className="bg-cyber-dark">{op}</option>
+                    ))}
                   </select>
-
-                  <input 
-                    type="number" 
+                  <input
+                    type="number"
                     value={rule.condition.value}
-                    onChange={(e) => updateRule(rule.id, 'condition.value', Number(e.target.value))}
-                    className="bg-cyber-navy border border-gray-700 text-white rounded p-2 w-20 outline-none focus:border-cyber-cyan"
+                    onChange={e => update(rule.id, 'condition.value', Number(e.target.value))}
+                    className="field w-24"
                   />
                 </div>
-                
-                <div className="flex items-center gap-3 text-sm text-gray-400">
-                  <span>Sustained for</span>
-                  <input 
-                    type="number" 
+                <div className="flex flex-wrap items-center gap-2 text-sm text-slate-400">
+                  держится
+                  <input
+                    type="number"
                     value={rule.condition.duration_seconds}
-                    onChange={(e) => updateRule(rule.id, 'condition.duration_seconds', Number(e.target.value))}
-                    className="bg-cyber-navy border border-gray-700 text-white rounded p-1 w-16 text-center outline-none focus:border-cyber-cyan"
+                    onChange={e => update(rule.id, 'condition.duration_seconds', Number(e.target.value))}
+                    className="field w-20 text-center"
                   />
-                  <span>seconds</span>
+                  сек, повтор не чаще
+                  <input
+                    type="number"
+                    value={rule.cooldown_seconds ?? 300}
+                    onChange={e => update(rule.id, 'cooldown_seconds', Number(e.target.value))}
+                    className="field w-24 text-center"
+                  />
+                  сек
                 </div>
               </div>
 
-              {/* THEN Action */}
-              <div className="space-y-4">
-                <h3 className="text-sm font-bold text-cyber-emerald uppercase tracking-wider flex items-center gap-2">
-                  <Zap className="w-4 h-4" />
-                  THEN (Action)
+              <div className="space-y-3">
+                <h3 className="flex items-center gap-2 text-xs font-bold uppercase tracking-wider text-emerald-300">
+                  <Zap className="h-4 w-4" /> То
                 </h3>
 
-                <div className="flex flex-col gap-3">
-                  <div className="flex items-center gap-3">
-                    <span className="text-gray-400">Set Emotion:</span>
-                    <select 
-                      value={rule.action.emotion}
-                      onChange={(e) => updateRule(rule.id, 'action.emotion', e.target.value)}
-                      className="bg-cyber-navy border border-gray-700 text-white rounded p-2 outline-none focus:border-cyber-cyan"
-                    >
-                      <option value="idle">Idle</option>
-                      <option value="happy">Happy</option>
-                      <option value="angry">Angry</option>
-                      <option value="sleepy">Sleepy</option>
-                      <option value="panic">Panic</option>
-                    </select>
-                  </div>
-                  
-                  <div className="flex flex-col gap-1">
-                    <span className="text-gray-400 text-sm">Speech Text:</span>
-                    <input 
-                      type="text" 
-                      value={rule.action.text}
-                      onChange={(e) => updateRule(rule.id, 'action.text', e.target.value)}
-                      placeholder="Optional text to speak..."
-                      className="bg-cyber-navy border border-gray-700 text-white rounded p-2 outline-none focus:border-cyber-cyan w-full"
-                    />
-                  </div>
-                </div>
-              </div>
+                <select
+                  value={rule.action.type}
+                  onChange={e => update(rule.id, 'action.type', e.target.value)}
+                  className="field"
+                >
+                  {ACTION_TYPES.map(type => (
+                    <option key={type.value} value={type.value} className="bg-cyber-dark">
+                      {type.label}
+                    </option>
+                  ))}
+                </select>
 
+                {rule.action.type !== 'agent_task' && (
+                  <select
+                    value={rule.action.emotion}
+                    onChange={e => update(rule.id, 'action.emotion', e.target.value)}
+                    className="field"
+                  >
+                    {EMOTIONS.map(emotion => (
+                      <option key={emotion} value={emotion} className="bg-cyber-dark">{emotion}</option>
+                    ))}
+                  </select>
+                )}
+
+                <input
+                  value={rule.action.type === 'agent_task' ? (rule.action.task ?? rule.action.text) : rule.action.text}
+                  onChange={e =>
+                    update(rule.id, rule.action.type === 'agent_task' ? 'action.task' : 'action.text', e.target.value)
+                  }
+                  placeholder={
+                    rule.action.type === 'agent_task'
+                      ? 'Например: найди процесс, который грузит CPU, и предложи что закрыть'
+                      : 'Что показать или сказать'
+                  }
+                  className="field"
+                />
+              </div>
             </div>
           </div>
         ))}
       </div>
 
-      <button 
+      <button
         onClick={addRule}
-        className="w-full p-4 border-2 border-dashed border-gray-700 hover:border-cyber-cyan text-gray-400 hover:text-cyber-cyan rounded-xl flex items-center justify-center gap-2 transition-colors"
+        className="flex w-full items-center justify-center gap-2 rounded-2xl border-2 border-dashed border-white/10 p-4 text-sm text-slate-400 transition-colors hover:border-cyber-cyan/50 hover:text-cyan-200"
       >
-        <Plus className="w-5 h-5" />
-        Add New Rule
+        <Plus className="h-4 w-4" /> Добавить правило
       </button>
-
     </div>
   );
 };

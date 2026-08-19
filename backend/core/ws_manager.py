@@ -1,4 +1,5 @@
 import logging
+import time
 
 from fastapi import WebSocket
 
@@ -8,20 +9,27 @@ logger = logging.getLogger("core.ws_manager")
 class ConnectionManager:
     def __init__(self):
         self.active_connections: list[WebSocket] = []
+        # Сокет самого питомца (M5), если он подключён по Wi-Fi.
+        # Нужен, чтобы не дублировать аудио в Serial, когда устройство уже на WebSocket.
+        self.device_ws: WebSocket | None = None
         self.device_info: dict = {
             "connected": False,
             "ip": "Not Connected",
             "ssid": "Not Connected",
             "rssi": 0,
-            "device": "M5Stack AtomS3",
+            "device": "M5Stack AtomS3R",
             "last_seen": None,
+            "transport": "none",  # none | wifi | usb
         }
 
     def update_device_info(
-        self, ip: str = None, ssid: str = None, rssi: int = None, device: str = None
+        self,
+        ip: str = None,
+        ssid: str = None,
+        rssi: int = None,
+        device: str = None,
+        transport: str = None,
     ):
-        import time
-
         self.device_info["connected"] = True
         if ip:
             self.device_info["ip"] = ip
@@ -31,7 +39,18 @@ class ConnectionManager:
             self.device_info["rssi"] = rssi
         if device:
             self.device_info["device"] = device
+        if transport:
+            self.device_info["transport"] = transport
         self.device_info["last_seen"] = time.strftime("%H:%M:%S")
+
+    def set_device_ws(self, websocket: WebSocket) -> None:
+        """Помечает соединение как соединение самого питомца."""
+        self.device_ws = websocket
+        self.device_info["transport"] = "wifi"
+
+    @property
+    def device_on_wifi(self) -> bool:
+        return self.device_ws is not None and self.device_ws in self.active_connections
 
     async def connect(self, websocket: WebSocket):
         await websocket.accept()
@@ -42,8 +61,10 @@ class ConnectionManager:
         if websocket in self.active_connections:
             self.active_connections.remove(websocket)
             logger.info("Client disconnected.")
-            if len(self.active_connections) == 0:
-                self.device_info["connected"] = False
+        if websocket is self.device_ws:
+            self.device_ws = None
+            self.device_info["connected"] = False
+            self.device_info["transport"] = "none"
 
     async def send_json(self, message: dict, websocket: WebSocket):
         try:
@@ -68,15 +89,9 @@ class ConnectionManager:
             await self.send_binary(data, connection)
 
     async def broadcast_binary_exclude(self, data: bytes, exclude_ws: WebSocket):
-        count = 0
         for connection in list(self.active_connections):
             if connection != exclude_ws:
                 await self.send_binary(data, connection)
-                count += 1
-        if count > 0 and len(data) > 0:
-            # We log every 100th message to avoid spam? Actually we can't easily track state here.
-            # Let's just log it if we really need to, or not at all.
-            pass
 
 
 manager = ConnectionManager()

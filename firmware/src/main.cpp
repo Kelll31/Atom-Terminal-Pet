@@ -166,7 +166,7 @@ void webSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
             if (petState.getEmotion() != PetEmotion::TALKING) {
                 petState.setEmotion(PetEmotion::TALKING);
             }
-            hardwareIO.playAudioStream(payload, length);
+            hardwareIO.enqueueAudio(payload, length);
             break;
         default:
             break;
@@ -278,7 +278,7 @@ void processSerial() {
                     if (petState.getEmotion() != PetEmotion::TALKING) {
                         petState.setEmotion(PetEmotion::TALKING);
                     }
-                    hardwareIO.playAudioStream(payload_buffer, msg_length);
+                    hardwareIO.enqueueAudio(payload_buffer, msg_length);
                 }
                 free(payload_buffer);
                 payload_buffer = nullptr;

@@ -1,5 +1,8 @@
 import asyncio
 import logging
+import shutil
+import subprocess
+import time
 
 import psutil
 
@@ -11,11 +14,9 @@ try:
     import GPUtil
 
     HAS_GPUTIL = True
-except ImportError:
+except Exception:  # GPUtil ломается на Python 3.13+ (нет distutils)
+    GPUtil = None
     HAS_GPUTIL = False
-    logger.warning(
-        "GPUtil not found. GPU monitoring will be disabled. Install with: pip install gputil"
-    )
 
 try:
     from winrt.windows.media.control import (
@@ -25,9 +26,7 @@ try:
     HAS_WINSDK = True
 except ImportError:
     HAS_WINSDK = False
-    logger.warning(
-        "winrt not found. Spotify/Media monitoring disabled. Install with: pip install winrt-Windows.Media.Control"
-    )
+    logger.warning("winrt не найден — информация о плеере недоступна")
 
 
 class PCMonitor:
@@ -35,9 +34,27 @@ class PCMonitor:
         self.interval_sec = interval_sec
         self.is_running = False
 
-        # Simple Pomodoro state
+        # Последние измеренные метрики — их читает агент и правила,
+        # чтобы не опрашивать железо на каждый запрос.
+        self._latest: dict = {
+            "cpu": 0,
+            "ram": 0,
+            "gpu": 0,
+            "temp": 0,
+            "spotify": "",
+            "ts": 0.0,
+        }
+
+        # Кэш опроса видеокарты
+        self._gpu_cache: tuple[int, int] = (0, 0)
+        self._gpu_cache_ts: float = 0.0
+
+        # Помодоро
         self.pomodoro_active = False
         self.pomodoro_time_left = 0
+
+    def latest_metrics(self) -> dict:
+        return dict(self._latest)
 
     async def get_media_info(self):
         if not HAS_WINSDK:
@@ -55,25 +72,67 @@ class PCMonitor:
             logger.debug(f"Media info error: {e}")
         return None
 
-    def get_gpu_usage(self):
-        if not HAS_GPUTIL:
-            return 0
+    def _read_nvidia_smi(self) -> tuple[int, int]:
+        """(загрузка %, температура °C) с кэшем — чтобы не дёргать процесс каждые 2 с."""
+        now = time.time()
+        if now - self._gpu_cache_ts < 5.0:
+            return self._gpu_cache
+
+        self._gpu_cache_ts = now
+        exe = shutil.which("nvidia-smi")
+        if not exe:
+            self._gpu_cache = (0, 0)
+            return self._gpu_cache
+
         try:
-            gpus = GPUtil.getGPUs()
-            if gpus:
-                return int(gpus[0].load * 100)
-        except Exception:
-            pass
-        return 0
+            output = subprocess.run(
+                [exe, "--query-gpu=utilization.gpu,temperature.gpu",
+                 "--format=csv,noheader,nounits"],
+                capture_output=True,
+                text=True,
+                timeout=4,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            ).stdout.strip().splitlines()
+            if output:
+                load, temp = (int(float(v)) for v in output[0].split(",")[:2])
+                self._gpu_cache = (load, temp)
+        except Exception as e:
+            logger.debug(f"nvidia-smi недоступен: {e}")
+            self._gpu_cache = (0, 0)
+        return self._gpu_cache
+
+    def get_gpu_usage(self):
+        if HAS_GPUTIL:
+            try:
+                gpus = GPUtil.getGPUs()
+                if gpus:
+                    return int(gpus[0].load * 100)
+            except Exception:
+                pass
+        return self._read_nvidia_smi()[0]
+
+    def get_gpu_temp(self):
+        if HAS_GPUTIL:
+            try:
+                gpus = GPUtil.getGPUs()
+                if gpus and gpus[0].temperature:
+                    return int(gpus[0].temperature)
+            except Exception:
+                pass
+        return self._read_nvidia_smi()[1]
 
     def get_cpu_temp(self):
-        # psutil temperatures are tricky on Windows, usually requires WMI or OpenHardwareMonitor.
-        # We will return a mock or try a fallback if it exists.
+        """На Windows psutil обычно не отдаёт температуру CPU без WMI/OHM,
+        поэтому используем температуру GPU как индикатор нагрева корпуса."""
         if hasattr(psutil, "sensors_temperatures"):
-            temps = psutil.sensors_temperatures()
-            if temps and "coretemp" in temps:
-                return int(temps["coretemp"][0].current)
-        return 40  # Mock default
+            try:
+                temps = psutil.sensors_temperatures() or {}
+                for key in ("coretemp", "k10temp", "acpitz"):
+                    if temps.get(key):
+                        return int(temps[key][0].current)
+            except Exception:
+                pass
+        return self.get_gpu_temp()
 
     async def collect_metrics(self):
         cpu = int(psutil.cpu_percent(interval=None))
@@ -98,28 +157,38 @@ class PCMonitor:
             self.pomodoro_time_left = max(
                 0, self.pomodoro_time_left - int(self.interval_sec)
             )
+            if self.pomodoro_time_left == 0:
+                self.pomodoro_active = False
 
+        self._latest = {
+            "cpu": cpu,
+            "ram": ram,
+            "gpu": gpu,
+            "temp": temp,
+            "spotify": media or "",
+            "ts": time.time(),
+        }
         return payload
 
     async def monitor_loop(self):
+        from core.events import bus
+
         self.is_running = True
-        logger.info("PC Monitor started.")
-        # Prime the CPU percent call
-        psutil.cpu_percent()
+        logger.info("Мониторинг ПК запущен.")
+        psutil.cpu_percent()  # первый вызов задаёт точку отсчёта
 
         while self.is_running:
             try:
-                if len(manager.active_connections) > 0:
-                    metrics = await self.collect_metrics()
-                    await manager.broadcast_json(metrics)
-                    logger.debug(f"Broadcasted metrics: {metrics}")
+                metrics = await self.collect_metrics()
+                if manager.active_connections or manager.device_on_wifi:
+                    await bus.emit_raw(metrics)
                 await asyncio.sleep(self.interval_sec)
             except asyncio.CancelledError:
                 self.is_running = False
-                logger.info("PC Monitor stopped.")
+                logger.info("Мониторинг ПК остановлен.")
                 break
             except Exception as e:
-                logger.error(f"Error in monitor loop: {e}")
+                logger.error(f"Ошибка в цикле мониторинга: {e}")
                 await asyncio.sleep(self.interval_sec)
 
     def start_pomodoro(self, duration_sec=1500):

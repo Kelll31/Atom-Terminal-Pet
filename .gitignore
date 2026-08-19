@@ -218,3 +218,12 @@ __marimo__/
 .streamlit/secrets.toml
 /firmware/.pio
 /backend/node_modules
+
+# ── Atom-Terminal-Pet ────────────────────────────────────────────────────────
+# Личные настройки с API-ключом (шаблон — backend/settings.example.json)
+/backend/settings.json
+# Память питомца, напоминания и журнал действий
+/backend/data/
+/backend/logs/
+/web/node_modules
+/web/dist

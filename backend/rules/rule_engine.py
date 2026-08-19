@@ -1,3 +1,14 @@
+"""Движок правил: реакция питомца на состояние ПК.
+
+Правило = условие по метрике (cpu/ram/gpu/temp) + действие:
+  * set_emotion — сменить мордочку и сказать фразу;
+  * speak       — только произнести фразу;
+  * agent_task  — поставить агенту задачу (например, «найди, что грузит процессор»).
+
+У каждого правила есть выдержка (duration_seconds) и период перезарядки
+(cooldown_seconds), чтобы питомец не тараторил одно и то же.
+"""
+
 import asyncio
 import logging
 import os
@@ -5,10 +16,11 @@ import time
 
 import yaml
 
-from core.ws_manager import manager
 from monitor.pc_monitor import pc_monitor
 
 logger = logging.getLogger("rules.engine")
+
+DEFAULT_COOLDOWN = 300
 
 
 class RuleEngine:
@@ -17,116 +29,108 @@ class RuleEngine:
         self.rules = []
         self.is_running = False
 
-        # State tracker: { rule_id: timestamp_condition_started_being_true }
-        self.rule_state = {}
+        # rule_id -> момент, когда условие стало истинным
+        self._active_since: dict[str, float] = {}
+        # rule_id -> момент последнего срабатывания
+        self._last_fired: dict[str, float] = {}
 
         self.load_rules()
 
+    @property
+    def full_path(self) -> str:
+        return os.path.join(os.path.dirname(os.path.dirname(__file__)), self.config_path)
+
     def load_rules(self):
-        full_path = os.path.join(
-            os.path.dirname(os.path.dirname(__file__)), self.config_path
-        )
-        if not os.path.exists(full_path):
-            logger.warning(f"Rules file not found at {full_path}")
+        if not os.path.exists(self.full_path):
+            logger.warning(f"Файл правил не найден: {self.full_path}")
+            self.rules = []
             return
 
-        with open(full_path, "r", encoding="utf-8") as f:
-            try:
-                data = yaml.safe_load(f)
-                self.rules = data.get("rules", [])
-                logger.info(f"Loaded {len(self.rules)} rules.")
-            except yaml.YAMLError as e:
-                logger.error(f"Failed to parse rules.yaml: {e}")
+        try:
+            with open(self.full_path, "r", encoding="utf-8") as f:
+                data = yaml.safe_load(f) or {}
+            self.rules = data.get("rules", []) or []
+            logger.info(f"Загружено правил: {len(self.rules)}")
+        except yaml.YAMLError as e:
+            logger.error(f"Не удалось разобрать rules.yaml: {e}")
 
     def evaluate_condition(self, condition, metrics) -> bool:
-        metric_name = condition.get("metric")
+        current = metrics.get(condition.get("metric"))
+        target = condition.get("value")
         operator = condition.get("operator")
-        target_value = condition.get("value")
-
-        current_value = metrics.get(metric_name)
-        if current_value is None:
+        if current is None or target is None:
             return False
 
-        if operator == ">":
-            return current_value > target_value
-        elif operator == "<":
-            return current_value < target_value
-        elif operator == "==":
-            return current_value == target_value
-        elif operator == ">=":
-            return current_value >= target_value
-        elif operator == "<=":
-            return current_value <= target_value
-        return False
+        comparisons = {
+            ">": lambda a, b: a > b,
+            "<": lambda a, b: a < b,
+            ">=": lambda a, b: a >= b,
+            "<=": lambda a, b: a <= b,
+            "==": lambda a, b: a == b,
+        }
+        check = comparisons.get(operator)
+        return bool(check and check(current, target))
 
-    async def execute_action(self, action):
-        action_type = action.get("type")
-        if action_type == "set_emotion":
-            payload = {
-                "action": "speak",
-                "emotion": action.get("emotion", "idle"),
-                "text": action.get("text", ""),
-            }
-            logger.info(f"Rule Triggered! Executing action: {payload}")
-            await manager.broadcast_json(payload)
+    async def execute_action(self, rule: dict):
+        from core.events import bus
+
+        action = rule.get("action", {}) or {}
+        action_type = action.get("type", "set_emotion")
+        emotion = action.get("emotion", "idle")
+        text = action.get("text", "")
+
+        logger.info(f"Сработало правило '{rule.get('id')}': {action_type}")
+
+        if action_type == "agent_task":
+            from tasks.task_manager import task_manager
+
+            prompt = action.get("task") or text
+            if prompt:
+                await task_manager.submit(prompt, source="rule")
+            return
+
+        if action_type == "speak":
+            await bus.speak(text, emotion=emotion)
+            return
+
+        await bus.emit("speak", emotion=emotion, text=text)
 
     async def engine_loop(self):
         self.is_running = True
-        logger.info("Rule Engine started.")
+        logger.info("Движок правил запущен.")
 
         while self.is_running:
             try:
-                # We reuse collect_metrics or fetch latest values
-                # Since pc_monitor is running, we can just grab latest (we need a way to store them)
-                # For simplicity, we just call collect_metrics here again or read properties
-                metrics = {
-                    "cpu": int(
-                        pc_monitor.get_gpu_usage()
-                    ),  # using as placeholder if we were caching, but let's just collect
-                    "temp": pc_monitor.get_cpu_temp(),
-                }
-
-                # A better approach: call collect_metrics
-                full_metrics = await pc_monitor.collect_metrics()
-
+                metrics = pc_monitor.latest_metrics()
                 now = time.time()
+
                 for rule in self.rules:
-                    rule_id = rule.get("id")
-                    cond = rule.get("condition")
+                    rule_id = str(rule.get("id"))
+                    condition = rule.get("condition") or {}
 
-                    if self.evaluate_condition(cond, full_metrics):
-                        if rule_id not in self.rule_state:
-                            self.rule_state[rule_id] = now
+                    if not self.evaluate_condition(condition, metrics):
+                        self._active_since.pop(rule_id, None)
+                        continue
 
-                        duration_needed = cond.get("duration_seconds", 0)
-                        time_active = now - self.rule_state[rule_id]
+                    started = self._active_since.setdefault(rule_id, now)
+                    if now - started < condition.get("duration_seconds", 0):
+                        continue
 
-                        # Use a flag to ensure we don't trigger endlessly
-                        # e.g., only trigger once per condition met
-                        trigger_key = f"{rule_id}_fired"
+                    cooldown = rule.get("cooldown_seconds", DEFAULT_COOLDOWN)
+                    if now - self._last_fired.get(rule_id, 0) < cooldown:
+                        continue
 
-                        if time_active >= duration_needed and not self.rule_state.get(
-                            trigger_key
-                        ):
-                            await self.execute_action(rule.get("action"))
-                            self.rule_state[trigger_key] = True  # Mark as fired
-                    else:
-                        # Condition no longer met, reset state
-                        if rule_id in self.rule_state:
-                            del self.rule_state[rule_id]
-                        trigger_key = f"{rule_id}_fired"
-                        if trigger_key in self.rule_state:
-                            del self.rule_state[trigger_key]
+                    self._last_fired[rule_id] = now
+                    await self.execute_action(rule)
 
-                await asyncio.sleep(1.0)
-
+                await asyncio.sleep(2.0)
             except asyncio.CancelledError:
                 self.is_running = False
-                logger.info("Rule Engine stopped.")
+                logger.info("Движок правил остановлен.")
                 break
             except Exception as e:
-                logger.error(f"Error in rule engine loop: {e}")
-                await asyncio.sleep(1.0)
+                logger.error(f"Ошибка в движке правил: {e}")
+                await asyncio.sleep(2.0)
 
 
 rule_engine = RuleEngine()

@@ -1,715 +1,528 @@
 #include "PetAnimator.h"
 #include "PCTracker.h"
+#include "HardwareIO.h"
+#include "Sensors.h"
+#include <math.h>
+#include <time.h>
 
 PetAnimator petAnimator;
 
-PetAnimator::PetAnimator() : canvas(&M5.Display) {
-    leftEye  = {30, 40};
-    rightEye = {98, 40};
-    targetLeftEye  = {30, 40};
-    targetRightEye = {98, 40};
+static inline float lerpf(float a, float b, float t) { return a + (b - a) * t; }
+static inline float clampf(float v, float lo, float hi) { return v < lo ? lo : (v > hi ? hi : v); }
 
-    eyeWidth  = 15; eyeHeight  = 25;
-    targetEyeWidth = 15; targetEyeHeight = 25;
-
-    mouthWidth  = 10; mouthHeight  = 4;
-    targetMouthWidth = 10; targetMouthHeight = 4;
-
-    isBlinking    = false;
-    nextBlinkTime = 0;
-    blinkPhase    = 0.0f;
-    saccadeX = 0.0f; saccadeY = 0.0f;
-    nextSaccadeTime = 0;
-    breathOffset = 0.0f;
-    frameCount = 0;
+PetAnimator::PetAnimator()
+    : canvas(&M5.Display),
+      lastEmotion(PetEmotion::INIT), emotionChangedAt(0),
+      screen(PetScreen::FACE), screenChangedAt(0),
+      saccadeX(0), saccadeY(0), nextSaccadeTime(0),
+      blinking(false), nextBlinkTime(0), pokeEnergy(0),
+      audioLevel(0), micLevel(0), bubbleUntil(0), rssi(0),
+      micMuted(false), wifiOk(false), serverOk(false), sensorsOk(false), clockValid(false),
+      historyIndex(0), lastHistoryTime(0), fps(0), lastFrameTime(0) {
+    bubbleText[0] = '\0';
+    strncpy(ssidText, "—", sizeof(ssidText));
+    strncpy(ipText, "—", sizeof(ipText));
+    strncpy(petName, "Atom", sizeof(petName));
+    memset(cpuHistory, 0, sizeof(cpuHistory));
+    memset(ramHistory, 0, sizeof(ramHistory));
 }
 
 void PetAnimator::init() {
+    canvas.setPsram(true);
     canvas.createSprite(128, 128);
-    canvas.setSwapBytes(false);
+    canvas.setTextWrap(false);
     nextBlinkTime = millis() + random(2000, 5000);
 }
 
-float PetAnimator::lerp(float a, float b, float t) {
-    return a + (b - a) * t;
+void PetAnimator::setScreen(PetScreen next) {
+    screen = next;
+    screenChangedAt = millis();
 }
 
-float PetAnimator::easeOut(float a, float b, float t) {
-    return a + (b - a) * t;
+void PetAnimator::nextScreen() {
+    setScreen((PetScreen)(((uint8_t)screen + 1) % (uint8_t)PetScreen::COUNT));
 }
 
-// ── Helpers ──────────────────────────────────────────────────────────────────
-
-void PetAnimator::drawHeart(int x, int y, int size, uint16_t color) {
-    int r = size / 2;
-    canvas.fillEllipse(x - r/2, y - r/2, r, r, color);
-    canvas.fillEllipse(x + r/2, y - r/2, r, r, color);
-    canvas.fillTriangle(x - r - r/2 + 2, y, x + r + r/2 - 2, y, x, y + size, color);
+void PetAnimator::showBubble(const char* text, uint32_t durationMs) {
+    if (!text || !text[0]) return;
+    strncpy(bubbleText, text, sizeof(bubbleText) - 1);
+    bubbleText[sizeof(bubbleText) - 1] = '\0';
+    bubbleUntil = millis() + durationMs;
+    screen = PetScreen::FACE;  // реплику всегда показываем на мордочке
 }
 
-// Draw a star at (cx, cy) with inner/outer radius
-void PetAnimator::drawStar(int cx, int cy, int outerR, int innerR, uint16_t color) {
-    float step = PI / 5.0f;
-    int px[10], py[10];
-    for (int i = 0; i < 10; i++) {
-        float angle = -PI / 2.0f + i * step;
-        float r = (i % 2 == 0) ? outerR : innerR;
-        px[i] = cx + (int)(cos(angle) * r);
-        py[i] = cy + (int)(sin(angle) * r);
-    }
-    for (int i = 0; i < 10; i++) {
-        int j = (i + 1) % 10;
-        canvas.drawLine(px[i], py[i], px[j], py[j], color);
-    }
+void PetAnimator::clearBubble() {
+    bubbleText[0] = '\0';
+    bubbleUntil = 0;
 }
 
-// Draw a lightning bolt
-void PetAnimator::drawLightning(int x, int y, int size, uint16_t color) {
-    int s = size;
-    canvas.fillTriangle(x,     y,     x+s,   y,     x,     y+s,   color);
-    canvas.fillTriangle(x,     y+s,   x+s,   y+s,   x+s,   y+2*s, color);
+void PetAnimator::setNetworkInfo(const char* ssid, const char* ip, int strength) {
+    if (ssid) { strncpy(ssidText, ssid, sizeof(ssidText) - 1); ssidText[sizeof(ssidText) - 1] = '\0'; }
+    if (ip)   { strncpy(ipText, ip, sizeof(ipText) - 1); ipText[sizeof(ipText) - 1] = '\0'; }
+    rssi = strength;
 }
 
-// ── Target update ─────────────────────────────────────────────────────────────
+void PetAnimator::setFlags(bool muted, bool wifi, bool server, bool sensorsPresent) {
+    micMuted = muted;
+    wifiOk = wifi;
+    serverOk = server;
+    sensorsOk = sensorsPresent;
+}
 
-void PetAnimator::updateTargets(float pitch, float roll) {
-    unsigned long now = millis();
-    frameCount++;
-    PetEmotion emo = petState.getEmotion();
+void PetAnimator::setPetName(const char* name) {
+    if (!name || !name[0]) return;
+    strncpy(petName, name, sizeof(petName) - 1);
+    petName[sizeof(petName) - 1] = '\0';
+}
 
-    // Base eye positions
-    float baseLeftX  = 30;
-    float baseRightX = 98;
-    float baseY      = 40;
+void PetAnimator::poke() {
+    pokeEnergy = 1.0f;
+}
 
-    // Breathing (slow sine wave)
-    breathOffset = sin(now * 0.0015f) * 2.0f;
+// ── Целевая поза по эмоции ──────────────────────────────────────────────────
+void PetAnimator::applyEmotionPose(PetEmotion emotion, uint32_t now) {
+    const float t = now * 0.001f;
 
-    // Saccades (random eye darting) — only for calm emotions
-    if (now > nextSaccadeTime) {
-        if (random(10) > 5 && (emo == PetEmotion::IDLE || emo == PetEmotion::THINKING || emo == PetEmotion::LISTENING)) {
-            saccadeX = random(-6, 7);
-            saccadeY = random(-4, 5);
-        } else {
-            saccadeX *= 0.5f;
-            saccadeY *= 0.5f;
-        }
-        nextSaccadeTime = now + random(300, 2500);
-    }
+    // Базовая поза: спокойный Патрик с приоткрытым ртом
+    target = FacePose();
+    target.eyeOpen    = 1.0f;
+    target.mouthOpen  = 0.32f;
+    target.mouthWidth = 0.45f;
+    target.drool      = 0.55f;
+    target.bob        = sinf(t * 1.6f) * 1.8f;
+    target.armSwing   = sinf(t * 1.2f) * 0.35f;
 
-    // IMU parallax
-    float parallaxX = constrain(roll  * 0.25f, -12.0f, 12.0f);
-    float parallaxY = constrain(pitch * 0.25f, -12.0f, 12.0f);
-
-    targetLeftEye.x  = baseLeftX  + parallaxX + saccadeX;
-    targetRightEye.x = baseRightX + parallaxX + saccadeX;
-    targetLeftEye.y  = baseY + parallaxY + saccadeY + breathOffset;
-    targetRightEye.y = baseY + parallaxY + saccadeY + breathOffset;
-
-    // Defaults
-    targetEyeWidth   = 15;
-    targetEyeHeight  = 25;
-    targetMouthWidth = 10;
-    targetMouthHeight = 4;
-
-    switch (emo) {
-        // ── HAPPY ──────────────────────────────────────────────────────────
+    switch (emotion) {
         case PetEmotion::HAPPY:
-            targetEyeHeight  = 8;   // Squinted happy
-            targetEyeWidth   = 18;
-            targetMouthWidth = 22;
-            targetMouthHeight = 14;
-            targetLeftEye.y  -= 4;
-            targetRightEye.y -= 4;
-            // Slight bounce
-            targetLeftEye.y  += sin(now * 0.008f) * 3;
-            targetRightEye.y += sin(now * 0.008f) * 3;
+            target.eyeOpen = 0.55f; target.eyeSquint = 0.45f;
+            target.browRaise = 4; target.mouthOpen = 0.75f; target.mouthWidth = 0.95f;
+            target.mouthCurve = 1.0f; target.blush = 0.8f; target.drool = 0.0f;
+            target.bob = sinf(t * 7.0f) * 5.0f;
+            target.squash = sinf(t * 7.0f) * 0.12f;
+            target.armSwing = sinf(t * 7.0f) * 0.9f;
             break;
 
-        // ── ANGRY ──────────────────────────────────────────────────────────
         case PetEmotion::ANGRY:
-            targetEyeHeight  = 10;
-            targetEyeWidth   = 13;
-            targetMouthWidth = 18;
-            targetMouthHeight = -10; // Frown
-            // Vibrate (rage tremor)
-            targetLeftEye.x  += (random(3) - 1) * 2;
-            targetRightEye.x += (random(3) - 1) * 2;
-            targetLeftEye.y  += (random(3) - 1);
-            targetRightEye.y += (random(3) - 1);
+            target.eyeOpen = 0.75f; target.browAngle = -1.0f; target.browRaise = -3;
+            target.mouthOpen = 0.5f; target.mouthWidth = 0.8f; target.mouthCurve = -1.0f;
+            target.drool = 0.0f;
+            target.lean = sinf(t * 22.0f) * 3.0f;
+            target.bob = sinf(t * 26.0f) * 1.5f;
             break;
 
-        // ── PANIC ──────────────────────────────────────────────────────────
-        case PetEmotion::PANIC:
-            targetEyeHeight  = 30;
-            targetEyeWidth   = 22;
-            targetMouthWidth = 16;
-            targetMouthHeight = 20;
-            // Fast vibration
-            targetLeftEye.x  += sin(now * 0.05f) * 3;
-            targetRightEye.x += cos(now * 0.05f) * 3;
-            targetLeftEye.y  += cos(now * 0.05f) * 2;
-            targetRightEye.y += sin(now * 0.05f) * 2;
-            break;
-
-        // ── SWEAT ──────────────────────────────────────────────────────────
-        case PetEmotion::SWEAT:
-            targetEyeHeight  = 20;
-            targetEyeWidth   = 14;
-            targetMouthWidth = 12;
-            targetMouthHeight = -4;
-            break;
-
-        // ── SLEEPING / SLEEPY ──────────────────────────────────────────────
-        case PetEmotion::SLEEPING:
-            targetEyeHeight  = 2;
-            targetEyeWidth   = 18;
-            targetMouthWidth = 6;
-            targetMouthHeight = 5; // Small O snore
-            break;
-
-        // ── LOVE ───────────────────────────────────────────────────────────
-        case PetEmotion::LOVE:
-            targetEyeHeight  = 14; // big hearts
-            targetEyeWidth   = 16;
-            targetMouthWidth = 18;
-            targetMouthHeight = 10;
-            // Float up gently
-            targetLeftEye.y  += sin(now * 0.003f) * 4 - 4;
-            targetRightEye.y += sin(now * 0.003f) * 4 - 4;
-            break;
-
-        // ── SAD ────────────────────────────────────────────────────────────
         case PetEmotion::SAD:
-            targetEyeHeight  = 16;
-            targetEyeWidth   = 12;
-            targetMouthWidth = 15;
-            targetMouthHeight = -7;
-            // Droop eyes
-            targetLeftEye.y  += 5;
-            targetRightEye.y += 5;
+            target.eyeOpen = 0.8f; target.browAngle = 1.0f; target.browRaise = -2;
+            target.mouthOpen = 0.0f; target.mouthCurve = -0.9f; target.mouthWidth = 0.5f;
+            target.drool = 0.0f; target.squash = -0.12f;
+            target.bob = 4 + sinf(t * 1.1f) * 1.5f;
+            target.lookY = 3;
             break;
 
-        // ── DIZZY ──────────────────────────────────────────────────────────
+        case PetEmotion::LOVE:
+            target.mouthOpen = 0.5f; target.mouthWidth = 0.8f; target.mouthCurve = 1.0f;
+            target.blush = 1.0f; target.drool = 0.0f;
+            target.bob = sinf(t * 2.2f) * 4.0f - 2.0f;
+            target.armSwing = sinf(t * 2.2f) * 0.6f;
+            break;
+
         case PetEmotion::DIZZY:
-            // Spinning crazy eyes
-            targetLeftEye.x  += sin(now * 0.012f) * 12;
-            targetLeftEye.y  += cos(now * 0.012f) * 12;
-            targetRightEye.x += sin(now * 0.012f + 3.14f) * 12;
-            targetRightEye.y += cos(now * 0.012f + 3.14f) * 12;
-            targetMouthWidth  = 5;
-            targetMouthHeight = 12;
+            target.eyeOpen = 1.0f; target.mouthOpen = 0.45f; target.mouthWidth = 0.3f;
+            target.drool = 0.9f;
+            target.lean = sinf(t * 3.0f) * 9.0f;
+            target.bob = cosf(t * 3.0f) * 3.0f;
             break;
 
-        // ── TALKING ────────────────────────────────────────────────────────
-        case PetEmotion::TALKING:
-            if ((now / 120) % 3 == 0)      { targetMouthHeight = 18; targetMouthWidth = 14; }
-            else if ((now / 120) % 3 == 1) { targetMouthHeight = 8;  targetMouthWidth = 10; }
-            else                            { targetMouthHeight = 2;  targetMouthWidth = 8;  }
+        case PetEmotion::SLEEPING:
+            target.eyeOpen = 0.0f; target.mouthOpen = 0.22f; target.mouthWidth = 0.2f;
+            target.drool = 1.0f; target.browRaise = 2;
+            target.bob = sinf(t * 0.8f) * 3.5f;
+            target.squash = sinf(t * 0.8f) * 0.08f;
+            target.armSwing = 0;
             break;
 
-        // ── LISTENING ──────────────────────────────────────────────────────
-        case PetEmotion::LISTENING:
-            targetEyeHeight  = 24 + sin(now * 0.01f) * 2; // Pulsing attentive eyes
-            targetEyeWidth   = 16;
-            targetMouthWidth = 10;
-            targetMouthHeight = 4 + sin(now * 0.015f) * 2; // Slightly open listening mouth
-            // Tilt head / eyes slightly upward
-            targetLeftEye.y  -= 4 + sin(now * 0.005f) * 2;
-            targetRightEye.y -= 4 + sin(now * 0.005f) * 2;
-            targetLeftEye.x  += sin(now * 0.003f) * 3;
-            targetRightEye.x += sin(now * 0.003f) * 3;
-            break;
-
-        // ── THINKING ───────────────────────────────────────────────────────
-        case PetEmotion::THINKING:
-            targetEyeHeight  = 18 + sin(now * 0.004f) * 3;
-            targetEyeWidth   = 14;
-            targetMouthWidth = 8;
-            targetMouthHeight = -3; // Slight thinking pucker
-            // Look up and to the top-right in a thoughtful posture
-            {
-                float glanceX = 8 + sin(now * 0.002f) * 4;
-                float glanceY = -8 + cos(now * 0.002f) * 3;
-                targetLeftEye.x  += glanceX;
-                targetRightEye.x += glanceX;
-                targetLeftEye.y  += glanceY;
-                targetRightEye.y += glanceY;
-            }
-            break;
-
-        // ── WORKING ────────────────────────────────────────────────────────
         case PetEmotion::WORKING:
-            targetEyeHeight  = 18;
-            targetEyeWidth   = 12;
-            targetMouthWidth = 10;
-            targetMouthHeight = 2;
-            // Focused — eyes dart left/right slowly
-            {
-                float gaze = sin(now * 0.0006f) * 12;
-                targetLeftEye.x  += gaze;
-                targetRightEye.x += gaze;
-            }
+            target.eyeOpen = 0.7f; target.eyeSquint = 0.25f; target.browAngle = -0.35f;
+            target.mouthOpen = 0.12f; target.mouthWidth = 0.35f; target.drool = 0.0f;
+            target.lookX = sinf(t * 0.9f) * 7.0f;
+            target.bob = sinf(t * 3.2f) * 2.0f;
             break;
 
-        // ── PARTY ──────────────────────────────────────────────────────────
+        case PetEmotion::LISTENING:
+            target.eyeOpen = 1.15f; target.browRaise = 5;
+            target.mouthOpen = 0.2f + micLevel * 0.25f;
+            target.mouthWidth = 0.4f;
+            target.drool = 0.5f;
+            target.lookY = -2;
+            target.bob = sinf(t * 2.0f) * 2.5f;
+            break;
+
+        case PetEmotion::TALKING:
+            // Рот открывается ровно настолько, насколько громкий звук идёт в динамик
+            target.eyeOpen = 0.95f;
+            target.mouthOpen = 0.25f + audioLevel * 0.75f;
+            target.mouthWidth = 0.5f + audioLevel * 0.4f;
+            target.drool = 0.35f;
+            target.bob = sinf(t * 6.0f) * 2.0f;
+            target.armSwing = sinf(t * 5.0f) * 0.5f;
+            break;
+
+        case PetEmotion::THINKING:
+            target.eyeOpen = 0.85f; target.browRaise = 3; target.browAngle = -0.2f;
+            target.mouthOpen = 0.08f; target.mouthWidth = 0.3f; target.drool = 0.0f;
+            target.lookX = 7 + sinf(t * 0.7f) * 3.0f;
+            target.lookY = -5;
+            target.lean = sinf(t * 0.6f) * 2.5f;
+            break;
+
+        case PetEmotion::PANIC:
+            target.eyeOpen = 1.35f; target.browRaise = 7; target.browAngle = 0.6f;
+            target.mouthOpen = 0.95f; target.mouthWidth = 0.6f; target.drool = 0.0f;
+            target.lean = sinf(t * 40.0f) * 4.0f;
+            target.bob = cosf(t * 37.0f) * 2.5f;
+            target.armSwing = sinf(t * 18.0f) * 1.0f;
+            break;
+
+        case PetEmotion::SWEAT:
+            target.eyeOpen = 0.6f; target.eyeSquint = 0.35f; target.browAngle = 0.5f;
+            target.mouthOpen = 0.3f; target.mouthCurve = -0.6f; target.mouthWidth = 0.5f;
+            target.blush = 0.5f; target.drool = 0.0f;
+            target.bob = sinf(t * 2.5f) * 2.0f;
+            break;
+
         case PetEmotion::PARTY:
-            targetEyeHeight  = 12;
-            targetEyeWidth   = 16;
-            targetMouthWidth = 20;
-            targetMouthHeight = 14;
-            // Bobbing
-            targetLeftEye.y  += sin(now * 0.02f) * 5;
-            targetRightEye.y += sin(now * 0.02f + 0.5f) * 5;
+            target.eyeOpen = 0.5f; target.eyeSquint = 0.5f; target.browRaise = 5;
+            target.mouthOpen = 0.8f; target.mouthWidth = 1.0f; target.mouthCurve = 1.0f;
+            target.blush = 0.9f; target.drool = 0.0f;
+            target.bob = sinf(t * 9.0f) * 6.0f;
+            target.lean = sinf(t * 4.5f) * 5.0f;
+            target.squash = sinf(t * 9.0f) * 0.18f;
+            target.armSwing = sinf(t * 9.0f) * 1.0f;
             break;
 
-        default:
+        case PetEmotion::INIT:
+            target.eyeOpen = 0.2f; target.mouthOpen = 0.1f; target.drool = 0.0f;
             break;
-    }
 
-    // ── Blink ─────────────────────────────────────────────────────────────
-    if (emo != PetEmotion::SLEEPING && emo != PetEmotion::DIZZY) {
-        if (!isBlinking && now > nextBlinkTime) {
-            isBlinking    = true;
-            nextBlinkTime = now + 120;
-        } else if (isBlinking && now > nextBlinkTime) {
-            isBlinking    = false;
-            nextBlinkTime = now + random(2000, 7000);
-        }
-        if (isBlinking) targetEyeHeight = 1;
+        default:  // IDLE
+            target.lookX = saccadeX;
+            target.lookY = saccadeY;
+            break;
     }
 }
 
-// ── Render ────────────────────────────────────────────────────────────────────
+// ── Обновление целей ────────────────────────────────────────────────────────
+void PetAnimator::updateTargets(float pitch, float roll) {
+    uint32_t now = millis();
+    PetEmotion emotion = petState.getEmotion();
 
+    if (emotion != lastEmotion) {
+        lastEmotion = emotion;
+        emotionChangedAt = now;
+        // Небольшой «щелчок» при смене настроения — оживляет переход
+        pokeEnergy = fmaxf(pokeEnergy, 0.45f);
+    }
+
+    // Случайные микродвижения глаз в спокойных состояниях
+    if (now > nextSaccadeTime) {
+        bool calm = emotion == PetEmotion::IDLE || emotion == PetEmotion::LISTENING ||
+                    emotion == PetEmotion::THINKING;
+        if (calm && random(10) > 4) {
+            saccadeX = random(-6, 7);
+            saccadeY = random(-3, 4);
+        } else {
+            saccadeX *= 0.4f;
+            saccadeY *= 0.4f;
+        }
+        nextSaccadeTime = now + random(400, 2600);
+    }
+
+    applyEmotionPose(emotion, now);
+
+    // Наклон корпуса и взгляд следуют за наклоном самого устройства
+    target.lean  += clampf(roll * 0.18f, -10.0f, 10.0f);
+    target.lookX += clampf(roll * 0.12f, -5.0f, 5.0f);
+    target.lookY += clampf(pitch * 0.10f, -4.0f, 4.0f);
+
+    // Моргание
+    if (emotion != PetEmotion::SLEEPING && emotion != PetEmotion::DIZZY && target.eyeOpen > 0.2f) {
+        if (!blinking && now > nextBlinkTime) {
+            blinking = true;
+            nextBlinkTime = now + 110;
+        } else if (blinking && now > nextBlinkTime) {
+            blinking = false;
+            nextBlinkTime = now + random(1800, 6000);
+        }
+        if (blinking) target.eyeOpen = 0.05f;
+    }
+
+    // Реакция на прикосновение: подпрыгнуть и сжаться
+    if (pokeEnergy > 0.01f) {
+        target.squash += pokeEnergy * 0.25f;
+        target.bob    -= pokeEnergy * 6.0f;
+        pokeEnergy *= 0.90f;
+    }
+}
+
+void PetAnimator::smoothPose() {
+    // Разные скорости: глаза щёлкают быстро, тело двигается плавно
+    pose.eyeOpen    = lerpf(pose.eyeOpen,    target.eyeOpen,    target.eyeOpen < pose.eyeOpen ? 0.6f : 0.3f);
+    pose.eyeSquint  = lerpf(pose.eyeSquint,  target.eyeSquint,  0.25f);
+    pose.browAngle  = lerpf(pose.browAngle,  target.browAngle,  0.2f);
+    pose.browRaise  = lerpf(pose.browRaise,  target.browRaise,  0.2f);
+    pose.mouthOpen  = lerpf(pose.mouthOpen,  target.mouthOpen,  0.45f);
+    pose.mouthWidth = lerpf(pose.mouthWidth, target.mouthWidth, 0.3f);
+    pose.mouthCurve = lerpf(pose.mouthCurve, target.mouthCurve, 0.25f);
+    pose.lookX      = lerpf(pose.lookX,      target.lookX,      0.25f);
+    pose.lookY      = lerpf(pose.lookY,      target.lookY,      0.25f);
+    pose.lean       = lerpf(pose.lean,       target.lean,       0.25f);
+    pose.squash     = lerpf(pose.squash,     target.squash,     0.3f);
+    pose.bob        = lerpf(pose.bob,        target.bob,        0.35f);
+    pose.blush      = lerpf(pose.blush,      target.blush,      0.15f);
+    pose.drool      = lerpf(pose.drool,      target.drool,      0.12f);
+    pose.armSwing   = lerpf(pose.armSwing,   target.armSwing,   0.25f);
+}
+
+// ── Кадр ────────────────────────────────────────────────────────────────────
 void PetAnimator::renderFrame() {
-    float t = 0.22f;
+    uint32_t now = millis();
+    smoothPose();
+    pushHistory(now);
 
-    leftEye.x  = easeOut(leftEye.x,  targetLeftEye.x,  t);
-    leftEye.y  = easeOut(leftEye.y,  targetLeftEye.y,  t);
-    rightEye.x = easeOut(rightEye.x, targetRightEye.x, t);
-    rightEye.y = easeOut(rightEye.y, targetRightEye.y, t);
-
-    float eyeT = (targetEyeHeight < eyeHeight) ? 0.75f : 0.18f;
-    eyeWidth  = easeOut(eyeWidth,  targetEyeWidth,  t);
-    eyeHeight = easeOut(eyeHeight, targetEyeHeight, eyeT);
-
-    mouthWidth  = easeOut(mouthWidth,  targetMouthWidth,  t);
-    mouthHeight = easeOut(mouthHeight, targetMouthHeight, t);
-
-    drawBackground();
-    drawPet();
-    drawHUD();
-    drawParticles();
+    switch (screen) {
+        case PetScreen::STATS: renderStatsScreen(now); break;
+        case PetScreen::CLOCK: renderClockScreen(now); break;
+        case PetScreen::INFO:  renderInfoScreen(now);  break;
+        default:
+            PetFace::draw(canvas, pose, petState.getEmotion(), now);
+            drawStatusStrip();
+            drawBubble();
+            break;
+    }
 
     canvas.pushSprite(0, 0);
+
+    uint32_t frameTime = now - lastFrameTime;
+    lastFrameTime = now;
+    if (frameTime > 0) fps = fps * 0.9f + (1000.0f / frameTime) * 0.1f;
 }
 
-// ── Background ────────────────────────────────────────────────────────────────
+// ── Верхняя строка состояния ────────────────────────────────────────────────
+void PetAnimator::drawStatusStrip() {
+    // Компактные индикаторы в углах, чтобы не закрывать мордочку
+    uint16_t ok   = canvas.color565(80, 230, 140);
+    uint16_t warn = canvas.color565(255, 190, 60);
+    uint16_t bad  = canvas.color565(255, 90, 90);
+    uint16_t dim  = canvas.color565(90, 100, 120);
 
-void PetAnimator::drawBackground() {
-    unsigned long now = millis();
-    PetEmotion emo = petState.getEmotion();
+    // Связь
+    canvas.fillSmoothCircle(6, 6, 3, serverOk ? ok : (wifiOk ? warn : bad));
 
-    canvas.fillSprite(TFT_BLACK);
-
-    switch (emo) {
-        case PetEmotion::PANIC:
-        case PetEmotion::SWEAT: {
-            // Pulsating red alert
-            uint8_t pulse = (uint8_t)((sin(now * 0.006f) + 1.0f) * 35);
-            canvas.fillRect(0, 0, 128, 128, canvas.color565(40 + pulse, 0, 0));
-            // Alert grid lines
-            canvas.drawRect(2, 2, 124, 124, canvas.color565(180, 0, 0));
-            canvas.drawRect(5, 5, 118, 118, canvas.color565(80, 0, 0));
-            break;
-        }
-        case PetEmotion::WORKING: {
-            // Deep blue focus
-            canvas.fillRect(0, 0, 128, 128, canvas.color565(0, 15, 45));
-            // Subtle scan lines
-            for (int y = 0; y < 128; y += 4) {
-                canvas.drawFastHLine(0, y, 128, canvas.color565(0, 20, 60));
-            }
-            break;
-        }
-        case PetEmotion::PARTY: {
-            // Dynamic RGB wave
-            float t = now * 0.005f;
-            uint8_t r = (uint8_t)((sin(t)           + 1.0f) * 55);
-            uint8_t g = (uint8_t)((sin(t + 2.094f)  + 1.0f) * 55);
-            uint8_t b = (uint8_t)((sin(t + 4.189f)  + 1.0f) * 55);
-            canvas.fillRect(0, 0, 128, 128, canvas.color565(r, g, b));
-            // Diagonal stripes
-            for (int i = -128; i < 256; i += 16) {
-                int phase = ((int)(now / 50)) % 16;
-                canvas.drawLine(i + phase, 0, i + phase + 128, 128, canvas.color565(r+30, g+30, b+30));
-            }
-            break;
-        }
-        case PetEmotion::LOVE: {
-            // Warm deep pink
-            canvas.fillRect(0, 0, 128, 128, canvas.color565(30, 0, 15));
-            // Floating hearts background
-            for (int i = 0; i < 3; i++) {
-                int hx = 20 + i * 44;
-                int hy = 10 + (int)(sin(now * 0.003f + i * 1.2f) * 8);
-                uint8_t alpha = 30 + i * 10;
-                drawHeart(hx, hy, 8, canvas.color565(alpha, 0, alpha / 2));
-            }
-            break;
-        }
-        case PetEmotion::SLEEPING: {
-            // Dark purple night
-            canvas.fillRect(0, 0, 128, 128, canvas.color565(5, 0, 15));
-            // Stars
-            srand(42);
-            for (int i = 0; i < 12; i++) {
-                int sx = rand() % 128;
-                int sy = rand() % 80;
-                uint8_t bright = (uint8_t)((sin(now * 0.002f + i * 0.8f) + 1.0f) * 60);
-                canvas.drawPixel(sx, sy, canvas.color565(bright, bright, bright));
-            }
-            break;
-        }
-        case PetEmotion::HAPPY: {
-            // Subtle warm background
-            uint8_t glow = (uint8_t)((sin(now * 0.004f) + 1.0f) * 20);
-            canvas.fillRect(0, 0, 128, 128, canvas.color565(glow, glow + 10, 0));
-            break;
-        }
-        case PetEmotion::LISTENING: {
-            // Cyber Cyan pulse
-            uint8_t pulse = (uint8_t)((sin(now * 0.008f) + 1.0f) * 20);
-            canvas.fillRect(0, 0, 128, 128, canvas.color565(0, 15 + pulse, 25 + pulse));
-            // Soundwave concentric radar rings
-            int ringR = (int)(now / 15) % 64;
-            canvas.drawEllipse(64, 50, ringR, ringR / 2, canvas.color565(0, 120, 200));
-            canvas.drawEllipse(64, 50, (ringR + 20) % 64, ((ringR + 20) % 64) / 2, canvas.color565(0, 80, 150));
-            break;
-        }
-        case PetEmotion::THINKING: {
-            // Deep Indigo / Matrix thinking grid
-            canvas.fillRect(0, 0, 128, 128, canvas.color565(5, 5, 25));
-            // Rotating circuit / thinking grid dots
-            for (int i = 0; i < 8; i++) {
-                float angle = now * 0.003f + i * (PI / 4.0f);
-                int gx = 64 + (int)(cos(angle) * 52);
-                int gy = 55 + (int)(sin(angle) * 40);
-                canvas.fillEllipse(gx, gy, 2, 2, canvas.color565(0, 180, 255));
-            }
-            break;
-        }
-        case PetEmotion::SAD: {
-            canvas.fillRect(0, 0, 128, 128, canvas.color565(0, 0, 20));
-            // Rain effect
-            srand(now / 200);
-            for (int i = 0; i < 8; i++) {
-                int rx = rand() % 128;
-                int ry = (rand() % 100) + 10;
-                canvas.drawFastVLine(rx, ry, 5, canvas.color565(40, 40, 100));
-            }
-            break;
-        }
-        case PetEmotion::ANGRY: {
-            canvas.fillRect(0, 0, 128, 128, canvas.color565(20, 0, 0));
-            // Zigzag border
-            for (int x = 0; x < 128; x += 8) {
-                canvas.drawLine(x,     0,   x + 4, 4,  canvas.color565(120, 0, 0));
-                canvas.drawLine(x + 4, 4,   x + 8, 0,  canvas.color565(120, 0, 0));
-                canvas.drawLine(x,     127, x + 4, 123, canvas.color565(120, 0, 0));
-                canvas.drawLine(x + 4, 123, x + 8, 127, canvas.color565(120, 0, 0));
-            }
-            break;
-        }
-        default:
-            // IDLE — subtle dark with a faint center glow (drawn as concentric dim circles)
-            canvas.fillRect(0, 0, 128, 128, canvas.color565(0, 3, 8));
-            canvas.drawEllipse(64, 64, 50, 50, canvas.color565(0, 10, 20));
-            canvas.drawEllipse(64, 64, 40, 40, canvas.color565(0, 8, 15));
-            break;
-    }
-}
-
-// ── Pet face ──────────────────────────────────────────────────────────────────
-
-void PetAnimator::drawPet() {
-    unsigned long now = millis();
-    PetEmotion emo = petState.getEmotion();
-
-    int lx = (int)leftEye.x,  ly = (int)leftEye.y;
-    int rx = (int)rightEye.x, ry = (int)rightEye.y;
-    int ew = (int)eyeWidth,   eh = max(1, (int)eyeHeight);
-
-    // ── Eyes ───────────────────────────────────────────────────────────────
-
-    if (emo == PetEmotion::LOVE) {
-        // Heart eyes (pulsating)
-        int hSize = max(10, (int)(eyeHeight * 1.5f) + (int)(sin(now * 0.006f) * 3));
-        drawHeart(lx, ly, hSize, canvas.color565(255, 60, 120));
-        drawHeart(rx, ry, hSize, canvas.color565(255, 60, 120));
-        // Glint
-        canvas.fillEllipse(lx + 3, ly - 3, 2, 2, TFT_WHITE);
-        canvas.fillEllipse(rx + 3, ry - 3, 2, 2, TFT_WHITE);
-
-    } else if (emo == PetEmotion::DIZZY) {
-        // X-X eyes (spinning circles)
-        for (int i = 0; i < 2; i++) {
-            int cx = (i == 0) ? lx : rx;
-            int cy = (i == 0) ? ly : ry;
-            canvas.drawEllipse(cx, cy, ew, eh, TFT_WHITE);
-            float a = now * 0.01f + i * 3.14f;
-            canvas.drawLine(cx - (int)(cos(a)*ew), cy - (int)(sin(a)*eh),
-                            cx + (int)(cos(a)*ew), cy + (int)(sin(a)*eh), TFT_WHITE);
-            canvas.drawLine(cx - (int)(cos(a+1.57f)*ew), cy - (int)(sin(a+1.57f)*eh),
-                            cx + (int)(cos(a+1.57f)*ew), cy + (int)(sin(a+1.57f)*eh), TFT_WHITE);
-        }
-
-    } else if (emo == PetEmotion::SLEEPING) {
-        // Flat closed eyes with ZZZ
-        canvas.fillEllipse(lx, ly, ew, max(1, eh), canvas.color565(180, 180, 180));
-        canvas.fillEllipse(rx, ry, ew, max(1, eh), canvas.color565(180, 180, 180));
-        // ZZZ floating up
-        int zPhase = (now % 3000);
-        float zY = ly - 30 - (zPhase % 3000) / 60.0f;
-        canvas.setTextColor(TFT_WHITE);
-        canvas.setTextDatum(MC_DATUM);
-        canvas.setTextSize(1);
-        if (zPhase > 300)  canvas.drawString("z", lx + 20, (int)zY + 15);
-        if (zPhase > 1000) canvas.drawString("Z", lx + 28, (int)zY);
-        if (zPhase > 1800) canvas.drawString("Z", lx + 38, (int)zY - 14);
-
+    // Микрофон
+    if (micMuted) {
+        canvas.fillSmoothCircle(18, 6, 3, bad);
+        canvas.drawLine(15, 3, 21, 9, canvas.color565(255, 255, 255));
     } else {
-        // Normal eyes — white sclera + dark pupil + glint
-        uint16_t scleraColor = TFT_WHITE;
-        if (emo == PetEmotion::ANGRY) scleraColor = canvas.color565(255, 180, 180);
-        if (emo == PetEmotion::SAD)   scleraColor = canvas.color565(180, 180, 255);
-
-        canvas.fillEllipse(lx, ly, ew, eh, scleraColor);
-        canvas.fillEllipse(rx, ry, ew, eh, scleraColor);
-
-        // Pupil (shrinks when blinking)
-        if (eh > 4) {
-            int pw = max(1, (int)(ew * 0.4f));
-            int ph = max(1, (int)(eh * 0.45f));
-            canvas.fillEllipse(lx, ly, pw, ph, TFT_BLACK);
-            canvas.fillEllipse(rx, ry, pw, ph, TFT_BLACK);
-            // Glint
-            if (eh > 7) {
-                canvas.fillEllipse(lx + 3, ly - 3, 2, 2, TFT_WHITE);
-                canvas.fillEllipse(rx + 3, ry - 3, 2, 2, TFT_WHITE);
-            }
-        }
-
-        // ── Eyelids ─────────────────────────────────────────────────────
-        uint16_t bg = TFT_BLACK;
-        if (emo == PetEmotion::PANIC || emo == PetEmotion::SWEAT) bg = canvas.color565(50, 0, 0);
-        else if (emo == PetEmotion::WORKING) bg = canvas.color565(0, 15, 45);
-        else if (emo == PetEmotion::PARTY) {
-            float t2 = now * 0.005f;
-            bg = canvas.color565((uint8_t)((sin(t2)+1)*50), (uint8_t)((sin(t2+2.1f)+1)*50), (uint8_t)((sin(t2+4.2f)+1)*50));
-        }
-        else if (emo == PetEmotion::HAPPY) bg = canvas.color565((uint8_t)((sin(now*0.004f)+1)*15), 20, 0);
-        else if (emo == PetEmotion::SAD)   bg = canvas.color565(0, 0, 20);
-        else if (emo == PetEmotion::ANGRY) bg = canvas.color565(20, 0, 0);
-
-        if (emo == PetEmotion::ANGRY) {
-            // Angry diagonal eyelids (steeper angle)
-            canvas.fillTriangle(lx-20, ly-28, lx+16, ly-28, lx+16, ly-4, bg);
-            canvas.fillTriangle(rx-16, ry-28, rx+20, ry-28, rx-16, ry-4, bg);
-            // Bold red eyebrows
-            for (int t2 = 0; t2 < 3; t2++) {
-                canvas.drawLine(lx-13, ly-14+t2, lx+11, ly-5+t2,  canvas.color565(255, 30, 30));
-                canvas.drawLine(rx-11, ry-5+t2,  rx+13, ry-14+t2, canvas.color565(255, 30, 30));
-            }
-        } else if (emo == PetEmotion::SAD) {
-            // Sad drooping eyelids
-            canvas.fillTriangle(lx-16, ly-28, lx+20, ly-28, lx-16, ly-4, bg);
-            canvas.fillTriangle(rx-20, ry-28, rx+16, ry-28, rx+16, ry-4, bg);
-        } else if (emo == PetEmotion::HAPPY) {
-            // Happy squint (top half masked)
-            canvas.fillRect(lx - ew - 2, ly - eh - 2, (ew+2)*2, eh + 2, bg);
-            canvas.fillRect(rx - ew - 2, ry - eh - 2, (ew+2)*2, eh + 2, bg);
-        }
+        int level = (int)(hardwareIO.getMicLevel() * 6);
+        canvas.fillSmoothCircle(18, 6, 2 + (level > 2 ? 2 : level), ok);
     }
 
-    // ── Cheeks ──────────────────────────────────────────────────────────────
-    if (emo == PetEmotion::LOVE || emo == PetEmotion::HAPPY || emo == PetEmotion::PARTY) {
-        uint8_t blush = (uint8_t)(140 + (int)(sin(now * 0.005f) * 30));
-        canvas.fillEllipse(lx - 14, ly + 16, 7, 4, canvas.color565(blush, 60, 80));
-        canvas.fillEllipse(rx + 14, ry + 16, 7, 4, canvas.color565(blush, 60, 80));
-    }
-
-    // ── Mouth ───────────────────────────────────────────────────────────────
-    int mouthX = 64;
-    int mouthY = 88 + (int)breathOffset;
-    int mw = max(2, (int)mouthWidth);
-    int mh = (int)mouthHeight;
-
-    if (emo == PetEmotion::TALKING) {
-        // Animated open mouth with tongue
-        canvas.fillEllipse(mouthX, mouthY, mw, max(1, abs(mh)), TFT_WHITE);
-        if (abs(mh) > 5) {
-            canvas.fillEllipse(mouthX, mouthY + max(1, abs(mh)) / 2, mw - 4, max(1, abs(mh)) / 3, canvas.color565(255, 80, 100));
-        }
-    } else if (mh > 0) {
-        // Open / smile filled ellipse
-        canvas.fillEllipse(mouthX, mouthY, mw, mh, TFT_WHITE);
-        // Teeth line
-        if (mh > 5) {
-            canvas.drawFastHLine(mouthX - mw + 2, mouthY, (mw - 2) * 2, canvas.color565(200, 200, 200));
-        }
-    } else {
-        // Frown / line
-        canvas.drawLine(mouthX - mw, mouthY,     mouthX + mw, mouthY - mh,     TFT_WHITE);
-        canvas.drawLine(mouthX - mw, mouthY - 1, mouthX + mw, mouthY - mh - 1, TFT_WHITE);
-        canvas.drawLine(mouthX - mw, mouthY - 2, mouthX + mw, mouthY - mh - 2, canvas.color565(160, 160, 160));
-    }
-
-    // ── Extras per emotion ──────────────────────────────────────────────────
-
-    // Sweat drop (PANIC / SWEAT)
-    if (emo == PetEmotion::PANIC || emo == PetEmotion::SWEAT) {
-        int sweatY = 8 + (int)((now % 1800) / 45);
-        if (sweatY < 40) {
-            canvas.fillEllipse(lx - 24, sweatY, 3, 5, canvas.color565(80, 160, 255));
-            canvas.fillEllipse(lx - 24, sweatY - 4, 2, 2, canvas.color565(80, 160, 255));
-        }
-    }
-
-    // Thinking bubble (THINKING)
-    if (emo == PetEmotion::THINKING) {
-        canvas.fillEllipse(rx + 20, ry - 10, 3, 3, canvas.color565(80, 80, 80));
-        canvas.fillEllipse(rx + 26, ry - 17, 4, 4, canvas.color565(80, 80, 80));
-        canvas.fillEllipse(rx + 34, ry - 26, 7, 7, canvas.color565(80, 80, 80));
-        canvas.drawString("?", rx + 34, ry - 26);
-    }
-
-    // Music notes (PARTY)
-    if (emo == PetEmotion::PARTY) {
-        int noteX = 10 + (int)(now / 30) % 110;
-        int noteY = 10 + (int)(sin(now * 0.01f + noteX) * 10);
-        canvas.setTextColor(canvas.color565(255, 255, 0));
-        canvas.setTextDatum(MC_DATUM);
-        canvas.drawString((now / 400) % 2 == 0 ? "♪" : "♫", noteX, noteY);
-    }
-
-    // Lightning bolts for ANGRY
-    if (emo == PetEmotion::ANGRY && (now / 300) % 3 == 0) {
-        drawLightning(5,  5, 8, canvas.color565(255, 220, 0));
-        drawLightning(110, 5, 8, canvas.color565(255, 220, 0));
+    // Нагрузка ПК — маленькой полоской справа
+    if (pcTracker.isActive()) {
+        int cpu = pcTracker.getCpu();
+        uint16_t color = cpu > 85 ? bad : (cpu > 60 ? warn : dim);
+        canvas.fillRoundRect(96, 3, 28, 7, 3, canvas.color565(20, 24, 34));
+        canvas.fillRoundRect(96, 3, 28 * cpu / 100, 7, 3, color);
     }
 }
 
-// ── HUD ───────────────────────────────────────────────────────────────────────
+// ── Реплика ─────────────────────────────────────────────────────────────────
+void PetAnimator::drawBubble() {
+    if (!bubbleText[0] || millis() > bubbleUntil) return;
 
-void PetAnimator::drawHUD() {
-    canvas.setTextColor(TFT_WHITE);
-    canvas.setTextDatum(MC_DATUM);
+    canvas.setTextSize(1);
+    canvas.setTextDatum(top_left);
+    canvas.setTextColor(canvas.color565(20, 24, 34));
+
+    // Перенос по словам под ширину 116 px
+    const int maxWidth = 112;
+    char lines[3][32];
+    int lineCount = 0;
+    int lineLen = 0;
+    lines[0][0] = '\0';
+
+    const char* p = bubbleText;
+    char word[24];
+    while (*p && lineCount < 3) {
+        int wl = 0;
+        while (*p == ' ') p++;
+        while (*p && *p != ' ' && wl < (int)sizeof(word) - 1) word[wl++] = *p++;
+        word[wl] = '\0';
+        if (wl == 0) break;
+
+        int candidate = lineLen + (lineLen ? 1 : 0) + wl;
+        if (candidate * 6 > maxWidth && lineLen > 0) {
+            lineCount++;
+            if (lineCount >= 3) break;
+            lines[lineCount][0] = '\0';
+            lineLen = 0;
+            candidate = wl;
+        }
+        if (lineLen) strncat(lines[lineCount], " ", 2);
+        strncat(lines[lineCount], word, sizeof(lines[0]) - strlen(lines[lineCount]) - 1);
+        lineLen = candidate;
+    }
+    if (lineCount < 3 && lines[lineCount][0]) lineCount++;
+    if (lineCount == 0) return;
+
+    int height = 8 + lineCount * 10;
+    int top = 128 - height - 4;
+
+    canvas.fillSmoothRoundRect(4, top, 120, height, 6, canvas.color565(236, 240, 248));
+    canvas.drawRoundRect(4, top, 120, height, 6, canvas.color565(120, 130, 150));
+
+    for (int i = 0; i < lineCount; i++) {
+        canvas.drawString(lines[i], 10, top + 5 + i * 10);
+    }
+}
+
+// ── Экран метрик ────────────────────────────────────────────────────────────
+void PetAnimator::pushHistory(uint32_t now) {
+    if (now - lastHistoryTime < 1000) return;
+    lastHistoryTime = now;
+    cpuHistory[historyIndex] = (uint8_t)pcTracker.getCpu();
+    ramHistory[historyIndex] = (uint8_t)pcTracker.getRam();
+    historyIndex = (historyIndex + 1) % HISTORY;
+}
+
+void PetAnimator::renderStatsScreen(uint32_t now) {
+    canvas.fillSprite(canvas.color565(6, 10, 18));
+    canvas.setTextDatum(top_left);
     canvas.setTextSize(1);
 
-    const char* text = petState.getEmotionText();
-    if (text && strlen(text) > 0) {
-        canvas.fillRect(0, 110, 128, 18, canvas.color565(20, 20, 30));
-        canvas.drawRect(0, 110, 128, 18, canvas.color565(40, 40, 60));
-        canvas.drawString(text, 64, 119);
+    struct Row { const char* label; int value; uint16_t color; const char* unit; };
+    Row rows[4] = {
+        {"CPU",  pcTracker.getCpu(),  canvas.color565(0, 220, 255), "%"},
+        {"RAM",  pcTracker.getRam(),  canvas.color565(180, 130, 255), "%"},
+        {"GPU",  pcTracker.getGpu(),  canvas.color565(255, 200, 60), "%"},
+        {"TEMP", pcTracker.getTemp(), canvas.color565(90, 230, 150), "C"},
+    };
+
+    canvas.setTextColor(canvas.color565(150, 160, 180));
+    canvas.drawString("SYSTEM", 6, 5);
+    canvas.drawString(pcTracker.isActive() ? "online" : "no data", 78, 5);
+
+    for (int i = 0; i < 4; i++) {
+        int y = 20 + i * 17;
+        canvas.setTextColor(canvas.color565(200, 210, 230));
+        canvas.drawString(rows[i].label, 6, y + 2);
+
+        int value = rows[i].value;
+        if (value < 0) value = 0;
+        if (value > 100) value = 100;
+
+        canvas.fillRoundRect(40, y, 60, 10, 4, canvas.color565(18, 24, 36));
+        canvas.fillRoundRect(40, y, 60 * value / 100, 10, 4, rows[i].color);
+
+        char buf[8];
+        snprintf(buf, sizeof(buf), "%d%s", rows[i].value, rows[i].unit);
+        canvas.setTextColor(rows[i].color);
+        canvas.drawString(buf, 104, y + 2);
     }
 
-    if (pcTracker.isActive()) {
-        canvas.fillRect(0, 0, 128, 12, canvas.color565(20, 20, 30));
-        canvas.drawRect(0, 0, 128, 12, canvas.color565(40, 40, 60));
-        char hudStr[32];
-        snprintf(hudStr, sizeof(hudStr), "C:%d%% R:%d%%", pcTracker.getCpu(), pcTracker.getRam());
-        canvas.drawString(hudStr, 64, 6);
-    }
-
-    if (pcTracker.isSpotifyPlaying()) {
-        canvas.fillRect(0, 12, 128, 12, canvas.color565(0, 40, 0));
-        canvas.drawString(pcTracker.getSpotifyTrack(), 64, 18);
+    // График истории CPU/RAM
+    canvas.setTextColor(canvas.color565(120, 130, 150));
+    canvas.drawString("60 sec", 6, 92);
+    for (int i = 0; i < HISTORY; i++) {
+        int idx = (historyIndex + i) % HISTORY;
+        int x = 8 + i * 2;
+        int cpuH = cpuHistory[idx] * 20 / 100;
+        int ramH = ramHistory[idx] * 20 / 100;
+        canvas.drawFastVLine(x, 124 - ramH, ramH, canvas.color565(70, 50, 120));
+        canvas.drawFastVLine(x, 124 - cpuH, cpuH, canvas.color565(0, 200, 235));
     }
 }
 
-// ── Particles ─────────────────────────────────────────────────────────────────
+// ── Экран часов ─────────────────────────────────────────────────────────────
+void PetAnimator::renderClockScreen(uint32_t now) {
+    canvas.fillSprite(canvas.color565(4, 6, 14));
+    canvas.setTextDatum(middle_center);
 
-void PetAnimator::drawParticles() {
-    unsigned long now = millis();
-    PetEmotion emo = petState.getEmotion();
-
-    if (emo == PetEmotion::HAPPY) {
-        // Floating stars
-        for (int i = 0; i < 4; i++) {
-            float phase = now * 0.002f + i * 1.57f;
-            int px = 10 + i * 30 + (int)(sin(phase * 0.7f) * 8);
-            int py = 100 - (int)((now / 20 + i * 30) % 90);
-            uint8_t bright = (uint8_t)((sin(phase) + 1.0f) * 100 + 55);
-            canvas.fillEllipse(px, py, 2, 2, canvas.color565(bright, bright, 0));
+    char timeStr[16] = "--:--";
+    char dateStr[24] = "";
+    if (clockValid) {
+        time_t rawTime = time(nullptr);
+        struct tm* t = localtime(&rawTime);
+        static const char* WEEKDAYS[7] = {"SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT"};
+        if (t) {
+            snprintf(timeStr, sizeof(timeStr), "%02d:%02d", t->tm_hour, t->tm_min);
+            snprintf(dateStr, sizeof(dateStr), "%02d.%02d  %s", t->tm_mday, t->tm_mon + 1,
+                     WEEKDAYS[t->tm_wday % 7]);
         }
-    } else if (emo == PetEmotion::LOVE) {
-        // Rising hearts
-        for (int i = 0; i < 3; i++) {
-            int elapsed = (now + i * 1000) % 2500;
-            int px = 25 + i * 38;
-            int py = 105 - elapsed / 22;
-            uint8_t alpha = (uint8_t)(255 - elapsed / 10);
-            if (alpha > 30) {
-                drawHeart(px, py, 6, canvas.color565(alpha, 30, alpha / 2));
-            }
-        }
-    } else if (emo == PetEmotion::SAD) {
-        // Falling teardrops
-        for (int i = 0; i < 3; i++) {
-            int elapsed = (now + i * 800) % 2000;
-            int px = 30 + i * 30;
-            int py = 50 + elapsed / 18;
-            if (py < 110) {
-                canvas.fillEllipse(px, py, 2, 3, canvas.color565(60, 60, 200));
-                canvas.fillEllipse(px, py - 3, 1, 1, canvas.color565(80, 80, 220));
-            }
-        }
-    } else if (emo == PetEmotion::ANGRY) {
-        // Sparks at corners
-        for (int i = 0; i < 3; i++) {
-            int elapsed = (now * 2 + i * 300) % 600;
-            if (elapsed < 300) {
-                int px = (i == 0) ? 10 : (i == 1 ? 118 : 64);
-                int py = 20 + elapsed / 10;
-                canvas.fillEllipse(px, py, 2, 2, canvas.color565(255, 100 + elapsed / 3, 0));
-            }
-        }
-    } else if (emo == PetEmotion::PANIC) {
-        // Exploding sparks from center
-        for (int i = 0; i < 5; i++) {
-            float angle = (now * 0.005f + i * 1.257f);
-            float dist  = (float)((now / 5 + i * 100) % 50);
-            int px = 64 + (int)(cos(angle) * dist);
-            int py = 64 + (int)(sin(angle) * dist);
-            if (px > 0 && px < 128 && py > 0 && py < 108) {
-                canvas.fillEllipse(px, py, 2, 2, canvas.color565(255, 200, 0));
-            }
-        }
-    } else if (emo == PetEmotion::LISTENING) {
-        // Equalizer / Audio Waveform Bars at bottom
-        for (int i = 0; i < 7; i++) {
-            int barX = 12 + i * 16;
-            int barH = 3 + (int)(abs(sin(now * 0.015f + i * 0.8f)) * 16);
-            canvas.fillRect(barX, 105 - barH, 8, barH, canvas.color565(0, 220, 255));
-            canvas.drawRect(barX, 105 - barH, 8, barH, canvas.color565(255, 255, 255));
-        }
-    } else if (emo == PetEmotion::THINKING) {
-        // Floating loading/thinking dots around head
-        for (int i = 0; i < 3; i++) {
-            float angle = now * 0.005f + i * (2.0f * PI / 3.0f);
-            int orbX = 64 + (int)(cos(angle) * 42);
-            int orbY = 40 + (int)(sin(angle) * 24);
-            uint8_t b = (uint8_t)(150 + sin(now * 0.01f + i) * 105);
-            canvas.fillEllipse(orbX, orbY, 3, 3, canvas.color565(b, 100, 255));
-        }
-        // Animated thinking ellipsis "..."
-        int dotCount = ((now / 400) % 4);
-        char dotsStr[8] = "";
-        for (int d = 0; d < dotCount; d++) strcat(dotsStr, ".");
-        canvas.setTextColor(canvas.color565(0, 220, 255));
-        canvas.setTextDatum(MC_DATUM);
-        canvas.drawString(dotsStr, 100, 20);
     }
+
+    canvas.setTextColor(canvas.color565(0, 220, 255));
+    canvas.setTextSize(3);
+    canvas.drawString(timeStr, 64, 40);
+
+    canvas.setTextSize(1);
+    canvas.setTextColor(canvas.color565(150, 160, 180));
+    canvas.drawString(dateStr, 64, 66);
+
+    // Помодоро
+    int pomodoro = pcTracker.getPomodoroLeft();
+    if (pomodoro > 0) {
+        char buf[24];
+        snprintf(buf, sizeof(buf), "FOCUS %d:%02d", pomodoro / 60, pomodoro % 60);
+        canvas.setTextColor(canvas.color565(90, 230, 150));
+        canvas.drawString(buf, 64, 86);
+
+        int total = 25 * 60;
+        int width = 100 * (total - pomodoro) / total;
+        canvas.fillRoundRect(14, 96, 100, 6, 3, canvas.color565(18, 24, 36));
+        canvas.fillRoundRect(14, 96, width, 6, 3, canvas.color565(90, 230, 150));
+    }
+
+    // Что играет
+    if (pcTracker.isSpotifyPlaying()) {
+        canvas.setTextColor(canvas.color565(200, 210, 230));
+        char track[26];
+        strncpy(track, pcTracker.getSpotifyTrack(), sizeof(track) - 1);
+        track[sizeof(track) - 1] = '\0';
+        canvas.drawString(track, 64, 116);
+    }
+}
+
+// ── Экран состояния ─────────────────────────────────────────────────────────
+void PetAnimator::renderInfoScreen(uint32_t now) {
+    canvas.fillSprite(canvas.color565(4, 8, 16));
+    canvas.setTextDatum(top_left);
+    canvas.setTextSize(1);
+
+    canvas.setTextColor(canvas.color565(0, 220, 255));
+    canvas.drawString(petName, 6, 6);
+    canvas.setTextColor(canvas.color565(120, 130, 150));
+    canvas.drawString("AtomS3R", 74, 6);
+
+    auto line = [&](int y, const char* label, const char* value, uint16_t color) {
+        canvas.setTextColor(canvas.color565(120, 130, 150));
+        canvas.drawString(label, 6, y);
+        canvas.setTextColor(color);
+        canvas.drawString(value, 46, y);
+    };
+
+    uint16_t ok  = canvas.color565(90, 230, 150);
+    uint16_t bad = canvas.color565(255, 110, 110);
+
+    line(24, "WiFi",  wifiOk ? ssidText : "нет", wifiOk ? ok : bad);
+    line(36, "IP",    ipText, canvas.color565(200, 210, 230));
+    line(48, "Server", serverOk ? "online" : "offline", serverOk ? ok : bad);
+    line(60, "Mic",   micMuted ? "muted" : "live", micMuted ? bad : ok);
+    line(72, "Audio", hardwareIO.isAudioReady() ? "ES8311" : "нет", hardwareIO.isAudioReady() ? ok : bad);
+    line(84, "Sense", sensorsOk ? "LTR553" : "нет", sensorsOk ? ok : canvas.color565(120, 130, 150));
+    line(96, "PSRAM", hardwareIO.hasPsram() ? "8 MB" : "нет", hardwareIO.hasPsram() ? ok : bad);
+
+    char buf[24];
+    snprintf(buf, sizeof(buf), "%d fps  %d dBm", (int)fps, rssi);
+    canvas.setTextColor(canvas.color565(100, 110, 130));
+    canvas.drawString(buf, 6, 112);
 }

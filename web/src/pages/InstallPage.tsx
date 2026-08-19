@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import EspWebInstallButton from '../components/EspWebInstallButton';
 import { Terminal, Cpu, Zap, Wifi, Server, Key, CheckCircle2, AlertCircle, Usb } from 'lucide-react';
+import { API_BASE } from '../config';
 
 const InstallPage: React.FC = () => {
   const [ssid, setSsid] = useState(() => localStorage.getItem('pet_ssid') || '');
@@ -15,7 +16,7 @@ const InstallPage: React.FC = () => {
   
   // Load settings from backend if available
   useEffect(() => {
-    fetch('/api/settings')
+    fetch(`${API_BASE}/api/settings`)
       .then(res => res.json())
       .then(data => {
         if (data.pet_name) {
@@ -191,7 +192,7 @@ const InstallPage: React.FC = () => {
                   type="button"
                   onClick={async () => {
                     try {
-                      const res = await fetch('/api/settings', {
+                      const res = await fetch(`${API_BASE}/api/settings`, {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
                         body: JSON.stringify({ pet_name: petName })

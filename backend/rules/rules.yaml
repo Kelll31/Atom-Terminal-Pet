@@ -1,1 +1,49 @@
-rules: []
+rules:
+- id: cpu_overload
+  description: Процессор долго держит высокую нагрузку
+  condition:
+    metric: cpu
+    operator: '>'
+    value: 90.0
+    duration_seconds: 30
+  action:
+    type: set_emotion
+    emotion: panic
+    text: CPU 90+
+  cooldown_seconds: 600
+- id: hot_hardware
+  description: Железо перегревается
+  condition:
+    metric: temp
+    operator: '>'
+    value: 82.0
+    duration_seconds: 60
+  action:
+    type: speak
+    emotion: sweat
+    text: Слушай, я тут закипаю. Восемьдесят с лишним градусов. Может, дать вентиляторам поработать?
+  cooldown_seconds: 900
+- id: ram_pressure
+  description: Оперативная память почти кончилась
+  condition:
+    metric: ram
+    operator: '>'
+    value: 92.0
+    duration_seconds: 120
+  action:
+    type: set_emotion
+    emotion: sweat
+    text: RAM 92+
+  cooldown_seconds: 900
+- id: idle_calm
+  description: Система отдыхает — питомец тоже
+  condition:
+    metric: cpu
+    operator: <
+    value: 8.0
+    duration_seconds: 900
+  action:
+    type: set_emotion
+    emotion: sleepy
+    text: zzz
+  cooldown_seconds: 1800

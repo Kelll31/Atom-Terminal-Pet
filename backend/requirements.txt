@@ -1,28 +1,36 @@
+# ── Веб-сервер ──────────────────────────────────────────────────────────────
 fastapi
 uvicorn[standard]
 pydantic>=2.10.1
-langchain
-langchain-openai
-langchain-community
-mcp
-pycaw
-pyautogui
-edge-tts
-PyYAML
 python-multipart
 jinja2
-SpeechRecognition
-langchain-ollama
-platformio>=6.1.19
+PyYAML
+python-dotenv
+httpx
+
+# ── ИИ-агент ────────────────────────────────────────────────────────────────
+langchain
+langchain-core
+langchain-openai
+langchain-community
+langgraph
+mcp>=1.0.0
+
+# ── Голос ───────────────────────────────────────────────────────────────────
+vosk              # офлайн-распознавание речи (модель качается скриптом)
+edge-tts          # запасной синтез речи
+pywin32           # SAPI5 — основной офлайн-синтез речи на Windows
 miniaudio
 pydub
-python-dotenv
+
+# ── Управление ПК ───────────────────────────────────────────────────────────
 psutil
-GPUtil
-winrt-Windows.Media.Control
-pydantic
-langgraph
-langchain-core
-pyyaml
-vosk
+pycaw             # громкость Windows
+comtypes
+pyautogui         # горячие клавиши и медиа-кнопки
+pyperclip         # буфер обмена
+winrt-Windows.Media.Control   # что играет в плеере
+
+# ── Устройство ──────────────────────────────────────────────────────────────
 pyserial
+platformio>=6.1.19

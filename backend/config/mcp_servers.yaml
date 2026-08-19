@@ -1,6 +1,18 @@
+# MCP-серверы, которые Атом поднимает при старте.
+# Управлять списком удобнее из web-панели: вкладка «Инструменты» → «MCP-серверы».
+#
+# Формат записи:
+#   имя:
+#     command: node|npx|python|...
+#     args: [...]
+#     env: {КЛЮЧ: значение}     # необязательно
+#     cwd: D:/путь              # необязательно, по умолчанию каталог backend
+#     enabled: true
+#     description: для чего сервер
 mcpServers:
-  # Web Search using DuckDuckGo (No API Key Required)
   web_search:
-    command: "node"
+    command: node
     args:
-      - "node_modules/duckduckgo-websearch/build/index.js"
+      - node_modules/duckduckgo-websearch/build/index.js
+    enabled: true
+    description: Поиск в интернете через DuckDuckGo (без ключей API)
