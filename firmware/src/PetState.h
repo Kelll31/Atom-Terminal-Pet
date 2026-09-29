@@ -54,6 +54,7 @@ private:
     uint32_t stateStartTime;
     uint32_t holdUntil;        // 0 — держать бессрочно
     uint32_t lastAttentionTime;
+    uint32_t lastDecayTime;
     int attentionLevel;        // 0..100
 };
 

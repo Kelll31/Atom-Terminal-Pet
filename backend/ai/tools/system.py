@@ -1,16 +1,26 @@
-"""Инструменты управления ПК (Windows): процессы, громкость, окна, клавиши."""
+"""Инструменты управления ПК (Windows): процессы, громкость, окна, клавиши.
+
+Уровни риска здесь местами зависят от аргументов, а не от инструмента:
+open_program без аргументов открывает файл, а с аргументами запускает
+произвольный процесс; clipboard на чтение безобиден, а на запись становится
+первым звеном цепочки «положить в буфер → win+r → вставить → enter».
+Такие случаи описаны функцией risk_for у соответствующего инструмента.
+"""
 
 from __future__ import annotations
 
 import logging
 import os
+import shlex
+import shutil
 import subprocess
 import time
+from typing import Any
 
 import psutil
 from pydantic import BaseModel, Field
 
-from ai.tools.base import ToolError, registry
+from ai.tools.base import ToolError, no_window_flags, registry
 
 logger = logging.getLogger("ai.tools.system")
 
@@ -111,6 +121,32 @@ class KillProcessArgs(BaseModel):
     all_matching: bool = Field(False, description="Завершить все процессы с таким именем")
 
 
+# Процессы, завершение которых роняет Windows в синий экран или выкидывает
+# пользователя из сеанса. Проверять список надо для КАЖДОГО кандидата, а не
+# только для строки запроса: поиск идёт по подстроке, поэтому цель «csrss»
+# сама по себе в списке не значится, но находит csrss.exe.
+PROTECTED_PROCESSES = {
+    "system",
+    "system idle process",
+    "registry",
+    "memory compression",
+    "smss.exe",
+    "csrss.exe",
+    "wininit.exe",
+    "winlogon.exe",
+    "services.exe",
+    "lsass.exe",
+    "lsaiso.exe",
+    "svchost.exe",
+    "fontdrvhost.exe",
+    "dwm.exe",
+}
+
+
+def _is_protected(name: str | None) -> bool:
+    return (name or "").strip().lower() in PROTECTED_PROCESSES
+
+
 @registry.tool(
     name="kill_process",
     description="Завершает зависший процесс по имени или PID. Необратимо — несохранённые данные будут потеряны.",
@@ -120,8 +156,9 @@ class KillProcessArgs(BaseModel):
 )
 def kill_process(target: str, all_matching: bool = False) -> str:
     target = str(target).strip()
-    protected = {"system", "csrss.exe", "wininit.exe", "winlogon.exe", "services.exe", "smss.exe"}
-    if target.lower() in protected:
+    if not target:
+        raise ToolError("Не указано, какой процесс завершать.")
+    if _is_protected(target):
         raise ToolError(f"Процесс {target} системный, трогать его нельзя.")
 
     killed: list[str] = []
@@ -129,6 +166,10 @@ def kill_process(target: str, all_matching: bool = False) -> str:
         try:
             p = psutil.Process(int(target))
             name = p.name()
+            if _is_protected(name):
+                raise ToolError(
+                    f"PID {target} — это системный процесс {name}, его завершение уронит Windows."
+                )
             p.terminate()
             killed.append(f"{name} (PID {target})")
         except psutil.NoSuchProcess:
@@ -136,15 +177,43 @@ def kill_process(target: str, all_matching: bool = False) -> str:
         except psutil.AccessDenied:
             raise ToolError(f"Нет прав завершить PID {target}. Нужен запуск от администратора.")
     else:
+        needle = target.lower()
+        exact: list[Any] = []
+        partial: list[Any] = []
+        blocked: set[str] = set()
+
         for p in psutil.process_iter(["pid", "name"]):
             try:
-                if target.lower() in (p.info["name"] or "").lower():
-                    p.terminate()
-                    killed.append(f"{p.info['name']} (PID {p.info['pid']})")
-                    if not all_matching:
-                        break
+                name = (p.info["name"] or "")
             except (psutil.NoSuchProcess, psutil.AccessDenied):
                 continue
+            lowered = name.lower()
+            if needle not in lowered:
+                continue
+            # Защищённые отсеиваем ДО завершения и по имени кандидата:
+            # запрос «csrss» иначе нашёл бы csrss.exe и убил систему.
+            if _is_protected(name):
+                blocked.add(name)
+                continue
+            # Точное совпадение сильнее подстрочного: «code» должен убить
+            # code.exe, а не vscode-helper.exe, если первый существует.
+            (exact if lowered in (needle, f"{needle}.exe") else partial).append(p)
+
+        for p in exact or partial:
+            try:
+                info = p.info
+                p.terminate()
+                killed.append(f"{info['name']} (PID {info['pid']})")
+                if not all_matching:
+                    break
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
+
+        if not killed and blocked:
+            raise ToolError(
+                f"Под '{target}' подходят только системные процессы "
+                f"({', '.join(sorted(blocked))}) — завершать их нельзя."
+            )
 
     if not killed:
         raise ToolError(f"Процесс '{target}' не найден.")
@@ -224,18 +293,44 @@ class PressKeysArgs(BaseModel):
     keys: str = Field(..., description="Сочетание клавиш через '+', например 'ctrl+shift+t' или 'win+d'")
 
 
+# Клавиши, которые превращают «нажать сочетание» в «запустить что угодно»
+# или «закрыть чужое окно без сохранения»:
+#   win           — открывает меню «Пуск» и win+r («Выполнить»),
+#   enter/return  — подтверждает то, что уже набрано в чужом окне,
+#   alt+f4        — закрывает активное приложение.
+_KEYS_ESCALATING = {"win", "winleft", "winright", "super", "command", "enter", "return"}
+
+
+def _keys_combo(keys: str) -> list[str]:
+    return [k.strip().lower() for k in str(keys).replace(" ", "").split("+") if k.strip()]
+
+
+def _press_keys_risk(args: dict[str, Any]) -> str:
+    combo = set(_keys_combo(args.get("keys", "")))
+    if combo & _KEYS_ESCALATING:
+        return "danger"
+    if "alt" in combo and "f4" in combo:
+        return "danger"
+    return "caution"
+
+
 @registry.tool(
     name="press_keys",
-    description="Нажимает сочетание клавиш в активном окне (ctrl+s, alt+tab, win+d и т.п.).",
+    description=(
+        "Нажимает сочетание клавиш в активном окне (ctrl+s, alt+tab, ctrl+shift+t). "
+        "Сочетания с win, enter и alt+f4 требуют подтверждения: ими можно запустить "
+        "произвольную программу или закрыть окно без сохранения."
+    ),
     args_model=PressKeysArgs,
     risk="caution",
+    risk_for=_press_keys_risk,
     category="system",
 )
 def press_keys(keys: str) -> str:
     try:
         import pyautogui
 
-        combo = [k.strip().lower() for k in keys.replace(" ", "").split("+") if k.strip()]
+        combo = _keys_combo(keys)
         if not combo:
             raise ToolError("Пустое сочетание клавиш.")
         pyautogui.hotkey(*combo)
@@ -250,30 +345,79 @@ class OpenProgramArgs(BaseModel):
     args: str = Field("", description="Дополнительные аргументы командной строки")
 
 
+def _open_program_risk(args: dict[str, Any]) -> str:
+    """С аргументами командной строки это уже не «открыть», а «выполнить».
+
+    'code' и 'D:/проект/отчёт.docx' — бытовые действия. А вот
+    'powershell' + '-enc <base64>' или 'cmd' + '/c ...' — это произвольный код,
+    и такое должно спрашивать подтверждение в любом режиме, кроме full.
+    """
+    return "danger" if str(args.get("args") or "").strip() else "caution"
+
+
 @registry.tool(
     name="open_program",
     description=(
         "Запускает программу, открывает файл, папку или URL в приложении по умолчанию. "
-        "Примеры target: 'code', 'notepad', 'https://github.com', 'D:/projects/app'."
+        "Примеры target: 'code', 'notepad', 'https://github.com', 'D:/projects/app'. "
+        "Запуск с аргументами командной строки требует подтверждения."
     ),
     args_model=OpenProgramArgs,
     risk="caution",
+    risk_for=_open_program_risk,
     category="system",
 )
 def open_program(target: str, args: str = "") -> str:
     target = target.strip()
+    args = (args or "").strip()
     if not target:
         raise ToolError("Не указано, что открывать.")
+
     try:
+        # Ссылки — только http/https и только в браузер. Схемы вроде file://,
+        # javascript: или ms-settings: сюда не пускаем: через них открывается
+        # локальный файл или системная панель в обход всех проверок.
         if target.lower().startswith(("http://", "https://")):
             import webbrowser
 
             webbrowser.open(target)
             return f"Открыл в браузере: {target}"
+        if "://" in target.split(" ", 1)[0]:
+            raise ToolError(
+                f"Схема в '{target}' не поддерживается — разрешены только http:// и https://."
+            )
 
-        cmd = f'start "" "{target}" {args}'.strip()
-        subprocess.Popen(cmd, shell=True)
-        return f"Запустил: {target} {args}".strip()
+        expanded = os.path.expandvars(os.path.expanduser(target))
+
+        # Файл или папка без аргументов — отдаём проводнику через os.startfile.
+        # Это ShellExecute с ОДНИМ параметром-путём: разбора командной строки
+        # там нет вовсе, поэтому кавычки и амперсанды в имени файла безопасны.
+        if not args and os.path.exists(expanded):
+            os.startfile(expanded)  # noqa: S606 — путь идёт отдельным параметром
+            return f"Открыл: {expanded}"
+
+        # Иначе это запуск программы. Собираем СПИСОК аргументов и запускаем
+        # без оболочки: posix=False у shlex обязателен, иначе на Windows
+        # обратные слэши пути съедаются как escape-последовательности.
+        executable = expanded if os.path.exists(expanded) else (shutil.which(target) or "")
+        if not executable:
+            raise ToolError(
+                f"'{target}' не найден ни как файл, ни как программа в PATH."
+            )
+
+        argv = [executable]
+        if args:
+            argv += shlex.split(args, posix=False)
+
+        subprocess.Popen(  # noqa: S603 — shell=False, аргументы списком
+            argv,
+            shell=False,
+            stdin=subprocess.DEVNULL,
+            creationflags=no_window_flags(),
+        )
+        return f"Запустил: {' '.join(argv)}"
+    except ToolError:
+        raise
     except Exception as e:
         raise ToolError(f"не удалось запустить '{target}': {e}")
 
@@ -282,11 +426,27 @@ class ClipboardArgs(BaseModel):
     text: str = Field("", description="Текст для записи в буфер обмена. Пусто — только прочитать.")
 
 
+def _clipboard_risk(args: dict[str, Any]) -> str:
+    """Запись в буфер — danger, чтение — caution.
+
+    Запись опасна не сама по себе, а в связке: «положить команду в буфер» +
+    press_keys win+r + ctrl+v + enter выполняет что угодно, причём каждый шаг
+    по отдельности выглядел безобидно. Чтение — caution, потому что в буфере
+    бывает пароль из менеджера паролей, а содержимое уходит в облачную модель.
+    """
+    return "danger" if str(args.get("text") or "") else "caution"
+
+
 @registry.tool(
     name="clipboard",
-    description="Читает буфер обмена, а если передан text — записывает его туда.",
+    description=(
+        "Читает буфер обмена, а если передан text — записывает его туда. "
+        "В буфере может лежать пароль, поэтому чтение подтверждается; запись — "
+        "тем более, ею можно подготовить команду для вставки в чужое окно."
+    ),
     args_model=ClipboardArgs,
-    risk="safe",
+    risk="caution",
+    risk_for=_clipboard_risk,
     category="system",
 )
 def clipboard(text: str = "") -> str:

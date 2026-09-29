@@ -38,7 +38,10 @@ class RuleEngine:
 
     @property
     def full_path(self) -> str:
-        return os.path.join(os.path.dirname(os.path.dirname(__file__)), self.config_path)
+        # Правила редактируются из панели, поэтому файл — в каталоге данных.
+        from core import paths
+
+        return paths.seeded(*self.config_path.split("/"))
 
     def load_rules(self):
         if not os.path.exists(self.full_path):

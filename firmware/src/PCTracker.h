@@ -21,7 +21,10 @@ public:
     int getTemp() const { return temperature; }
 
     bool isSpotifyPlaying() const { return spotifyPlaying; }
-    const char* getSpotifyTrack() const { return currentTrack.c_str(); }
+    // Название трека читает задача отрисовки, а пишет основной цикл. Буфер
+    // фиксированный именно поэтому: у String при переприсваивании освобождается
+    // старая память, и указатель под задачей отрисовки становился висячим.
+    const char* getSpotifyTrack() const { return currentTrack; }
 
     int  getPomodoroLeft() const { return pomodoroTimeLeft; }
     bool isPomodoroActive() const { return pomodoroTimeLeft > 0; }
@@ -36,7 +39,7 @@ private:
     int temperature;
 
     bool spotifyPlaying;
-    String currentTrack;
+    char currentTrack[64];
 
     int pomodoroTimeLeft;
     unsigned long lastPomodoroTick;

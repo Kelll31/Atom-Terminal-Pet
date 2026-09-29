@@ -21,13 +21,16 @@ from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from ai.agent import agent, is_wake_word_present, tools_snapshot
-from ai.stt import transcribe_audio_stream
+from ai import llm as llm_backend
+from ai.agent import agent, tools_snapshot
 from ai.tools import registry
+from ai.voice import voice_pipeline
 from core.events import bus
+from core import paths
 from core.mcp_client import mcp_manager
 from core.serial_manager import serial_manager
 from core.settings import settings_store
+from core.updater import updater
 from core.ws_manager import manager
 from core import stats
 from monitor.pc_monitor import pc_monitor
@@ -39,13 +42,15 @@ logging.basicConfig(
 )
 logger = logging.getLogger("main")
 
-BACKEND_DIR = os.path.dirname(os.path.abspath(__file__))
-WEB_DIR = os.path.join(os.path.dirname(BACKEND_DIR), "web")
+BACKEND_DIR = paths.DATA_ROOT
+WEB_DIR = paths.resource("web")
+
+paths.ensure_dirs()
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    logger.info("Атом просыпается…")
+    logger.info("Патрик просыпается…")
 
     app.state.monitor_task = asyncio.create_task(pc_monitor.monitor_loop())
     app.state.rule_engine_task = asyncio.create_task(rule_engine.engine_loop())
@@ -60,15 +65,21 @@ async def lifespan(app: FastAPI):
     # MCP-серверы поднимаем в фоне: медленный сервер не должен блокировать старт
     app.state.mcp_task = asyncio.create_task(mcp_manager.initialize())
 
+    # Цикл чтения порта запускаем всегда: он сам подключится, когда питомца
+    # воткнут в USB. Раньше при старте без устройства цикл не создавался вовсе,
+    # и подключённый позже питомец так и оставался незамеченным.
     if serial_manager.connect():
-        ensure_serial_reader()
         manager.update_device_info(transport="usb")
+    ensure_serial_reader()
+    app.state.device_task = asyncio.create_task(device_watchdog())
+    app.state.update_task = asyncio.create_task(update_watchdog())
 
     logger.info(f"Инструментов доступно: {len(registry.all())}")
     yield
 
     logger.info("Останавливаюсь…")
-    for attr in ("monitor_task", "rule_engine_task", "serial_task", "mcp_task"):
+    for attr in ("monitor_task", "rule_engine_task", "serial_task", "mcp_task", "device_task",
+                 "update_task"):
         task = getattr(app.state, attr, None)
         if task:
             task.cancel()
@@ -82,7 +93,7 @@ async def lifespan(app: FastAPI):
             pass
 
 
-app = FastAPI(title="Atom-Terminal-Pet Brain", version="1.0.0", lifespan=lifespan)
+app = FastAPI(title="Atom-Terminal-Pet Brain", version=paths.version(), lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -103,33 +114,21 @@ if os.path.exists(FIRMWARE_DIR):
 async def handle_audio_stream(
     audio_data: bytes, exclude_ws: WebSocket | None = None, source: str | None = None
 ):
-    """Аудио с микрофона питомца: ретрансляция в панель + распознавание речи."""
+    """Аудио с микрофона: ретрансляция в панель + голосовой конвейер."""
     stats.track_mic(audio_data)
+
+    # Звук с устройства — сам по себе доказательство, что питомец на связи
+    if source == "serial" and manager.mark_device_seen("usb"):
+        await bus.emit("device_status_update", device_info=manager.device_info)
 
     if exclude_ws is not None:
         await manager.broadcast_binary_exclude(audio_data, exclude_ws)
     else:
         await manager.broadcast_binary(audio_data)
 
-    # Пока питомец говорит, микрофон слышит его самого — не распознаём эхо.
-    if bus.is_speaking:
-        return
-
-    is_complete, text = await transcribe_audio_stream(audio_data)
-    if not text:
-        return
-
-    if not is_complete:
-        await bus.emit("user_speech_partial", text=text)
-        return
-
-    await bus.emit("user_speech", text=text)
-
-    if not is_wake_word_present(text):
-        logger.info(f"Реплика без обращения по имени, игнорирую: {text}")
-        return
-
-    await task_manager.submit(text, source="voice")
+    # Дальше всё решает конвейер: детектор речи, сборка фразы, распознавание,
+    # проверка обращения и перебивание (см. ai/voice.py).
+    await voice_pipeline.feed(audio_data)
 
 
 async def handle_json_message(
@@ -147,6 +146,16 @@ async def handle_json_message(
             device=payload.get("device"),
             transport="wifi" if websocket is not None else "usb",
         )
+        # Прошивка сообщает, что у неё поднялось: кодек, датчики, PSRAM.
+        # Это сразу видно в панели — не надо гадать, почему нет звука.
+        # drop_in/drop_out — счётчики потерянных кадров звука: по ним видно,
+        # тормозит сеть или прошивка не успевает разгребать буферы.
+        for field in (
+            "fw", "mic", "audio", "sensors", "psram", "i2c", "heap",
+            "volume", "drop_in", "drop_out",
+        ):
+            if field in payload:
+                manager.device_info[field] = payload[field]
         await bus.emit("device_status_update", device_info=manager.device_info)
         return
 
@@ -162,6 +171,16 @@ async def handle_json_message(
 
     if action == "cancel_task":
         await task_manager.cancel(payload.get("task_id", ""))
+        return
+
+    # Питомца перебили: кнопкой на устройстве, встряской или из панели
+    if action == "interrupt":
+        await voice_pipeline.interrupt(payload.get("reason", "device"))
+        return
+
+    # Устройство сообщает, что его погладили
+    if action == "pet_touched":
+        await bus.emit("pet_touched", source=payload.get("source", "button"))
         return
 
     if action == "reset_chat":
@@ -238,10 +257,29 @@ class SettingsPayload(BaseModel):
     require_wake_word: bool | None = None
     speak_replies: bool | None = None
     audio_output: str | None = None
+
+    # Голос
+    voice_enabled: bool | None = None
+    live_mode: bool | None = None
+    conversation_window_sec: int | None = None
+    vad_min_level: float | None = None
+    vad_sensitivity: float | None = None
+    endpoint_silence_sec: float | None = None
+    barge_in: bool | None = None
+    barge_in_level: float | None = None
+    stt_engine: str | None = None
+    stt_model: str | None = None
+    stt_base_url: str | None = None
+    stt_api_key: str | None = None
     autonomy: str | None = None
     allowed_roots: list[str] | None = None
     disabled_tools: list[str] | None = None
     mcp_enabled: bool | None = None
+
+    # Обновления и окно панели
+    auto_check_updates: bool | None = None
+    update_url: str | None = None
+    panel_window: bool | None = None
 
 
 class AISettings(BaseModel):
@@ -254,16 +292,54 @@ class AISettings(BaseModel):
 async def api_health():
     return {
         "status": "ok",
+        "version": paths.version(),
+        "update": updater.state.available.version if updater.should_notify else "",
         "clients": len(manager.active_connections),
         "device": manager.device_info,
         "serial_connected": serial_manager.is_connected,
         "tools": len(registry.all()),
         "mcp": mcp_manager.status(),
         "model": settings_store.get("model_name"),
-        "has_key": bool(settings_store.get("api_key")),
+        # Мозг считается настроенным и без ключа — если выбрана локальная модель
+        "has_key": not llm_backend.needs_api_key(
+            settings_store.get("api_key"), settings_store.get("base_url")
+        ),
+        "local_model": llm_backend.is_local(settings_store.get("base_url")),
         "audio": stats.snapshot(),
         "speaking": bus.is_speaking,
     }
+
+
+@app.get("/api/voice")
+async def api_voice_state():
+    settings = settings_store.current
+    return {
+        "state": voice_pipeline.state.dict(),
+        "enabled": settings.voice_enabled,
+        "live_mode": settings.live_mode,
+        "require_wake_word": settings.require_wake_word,
+        "barge_in": settings.barge_in,
+        "engine": settings.stt_engine,
+        "wake_words": settings.wake_words,
+        "speaking": bus.is_speaking,
+    }
+
+
+@app.post("/api/voice/interrupt")
+async def api_voice_interrupt():
+    """Перебить питомца из панели — то же, что нажать кнопку на устройстве."""
+    interrupted = await voice_pipeline.interrupt("panel")
+    return {"status": "success", "interrupted": interrupted}
+
+
+@app.post("/api/voice/conversation")
+async def api_voice_conversation(open: bool = True):
+    """Открыть или закрыть окно живого диалога вручную."""
+    if open:
+        voice_pipeline.open_conversation()
+    else:
+        voice_pipeline.close_conversation()
+    return {"status": "success", "state": voice_pipeline.state.dict()}
 
 
 class SayPayload(BaseModel):
@@ -306,32 +382,137 @@ def update_settings(payload: SettingsPayload):
 
 @app.post("/api/settings/test")
 async def test_settings(payload: AISettings):
-    """Проверка связи с LLM без сохранения настроек."""
+    """Проверка связи с моделью без сохранения настроек.
+
+    Пробуем сразу с инструментами: питомцу мало уметь разговаривать, ему нужно
+    вызывать функции. Локальные модели это умеют не все, поэтому при отказе
+    повторяем без инструментов — так пользователь видит разницу между
+    «модель недоступна» и «модель отвечает, но действовать не сможет».
+    """
     from langchain_core.messages import HumanMessage
-    from langchain_openai import ChatOpenAI
 
     api_key = payload.api_key or settings_store.get("api_key")
-    if not api_key:
-        return {"status": "error", "message": "Не указан API-ключ."}
-
-    headers = {}
     base_url = payload.base_url or settings_store.get("base_url")
-    if base_url and "openrouter.ai" in base_url.lower():
-        headers = {"HTTP-Referer": "http://localhost:8000", "X-Title": "Atom-Terminal-Pet"}
+    model_name = payload.model_name or settings_store.get("model_name")
+
+    if llm_backend.needs_api_key(api_key, base_url):
+        return {
+            "status": "error",
+            "message": "Не указан ни API-ключ, ни адрес локальной модели.",
+        }
+
+    prompt = [HumanMessage(content="Ответь ровно: Test OK")]
+
+    async def ask(with_tools: bool):
+        llm = llm_backend.build_chat_model(
+            api_key=api_key,
+            base_url=base_url,
+            model=model_name,
+            timeout=60 if llm_backend.is_local(base_url) else 20,
+        )
+        if with_tools:
+            llm = llm.bind_tools([llm_backend.PROBE_TOOL_SCHEMA])
+        return await llm.ainvoke(prompt)
 
     try:
-        llm = ChatOpenAI(
-            api_key=api_key,
-            base_url=base_url or None,
-            model=payload.model_name or settings_store.get("model_name") or "gpt-4o-mini",
-            max_retries=1,
-            timeout=20,
-            default_headers=headers,
-        )
-        result = await llm.ainvoke([HumanMessage(content="Ответь ровно: Test OK")])
-        return {"status": "success", "message": result.content}
-    except Exception as e:
+        result = await ask(with_tools=True)
+        tools_ok = True
+    except Exception as tools_error:  # noqa: BLE001 — модель может не знать инструментов
+        logger.info(f"Проверка связи с инструментами не прошла: {tools_error}")
+        try:
+            result = await ask(with_tools=False)
+            tools_ok = False
+        except Exception as e:  # noqa: BLE001
+            return {"status": "error", "message": str(e)}
+
+    text = result.content if isinstance(result.content, str) else str(result.content)
+    return {
+        "status": "success",
+        "message": text.strip() or "(пустой ответ)",
+        "tools_supported": tools_ok,
+        "local": llm_backend.is_local(base_url),
+        "note": (
+            ""
+            if tools_ok
+            else "Модель отвечает, но не поддерживает вызов инструментов — "
+            "питомец сможет только разговаривать. Выберите модель с поддержкой tool calling."
+        ),
+    }
+
+
+@app.post("/api/llm/models")
+async def api_llm_models(payload: AISettings):
+    """Список моделей, доступных на указанном сервере."""
+    base_url = payload.base_url or settings_store.get("base_url")
+    api_key = payload.api_key or settings_store.get("api_key")
+
+    if llm_backend.needs_api_key(api_key, base_url):
+        return {"status": "error", "message": "Нужен API-ключ или адрес локального сервера.", "models": []}
+
+    try:
+        models = await llm_backend.fetch_models(base_url, api_key)
+    except Exception as e:  # noqa: BLE001
+        return {"status": "error", "message": str(e), "models": []}
+
+    chat = llm_backend.chat_models(models)
+    return {
+        "status": "success",
+        "models": chat,
+        "skipped_embeddings": len(models) - len(chat),
+        "base_url": llm_backend.normalize_base_url(base_url),
+    }
+
+
+# ── Обновление программы ───────────────────────────────────────────────────
+@app.get("/api/update")
+async def api_update_state():
+    """Что известно про версии — без обращения к сети."""
+    return updater.state.dict()
+
+
+@app.post("/api/update/check")
+async def api_update_check(force: bool = True):
+    state = await updater.check(force=force)
+    return state.dict()
+
+
+@app.post("/api/update/install")
+async def api_update_install():
+    """Скачивает установщик и запускает тихую установку.
+
+    Прогресс уходит в панель событиями, а сама программа через пару секунд
+    закрывается: установщик ставит новую версию поверх и запускает её снова.
+    """
+
+    async def progress(percent: int):
+        await bus.emit("update_progress", percent=percent)
+
+    try:
+        path = await updater.install(progress=progress)
+    except Exception as e:  # noqa: BLE001 — сеть, права, отказ от UAC
+        logger.error(f"Обновление не удалось: {e}")
+        await bus.emit("update_progress", percent=0, error=str(e))
         return {"status": "error", "message": str(e)}
+
+    await bus.emit("update_progress", percent=100, installing=True)
+    return {"status": "success", "installer": path}
+
+
+@app.post("/api/update/skip")
+async def api_update_skip(version: str):
+    return updater.skip(version).dict()
+
+
+@app.get("/api/llm/discover")
+async def api_llm_discover():
+    """Поиск запущенного локального сервера моделей на типовых портах."""
+    found = await llm_backend.discover_local()
+    return {
+        "status": "success",
+        "servers": [
+            {**server, "models": llm_backend.chat_models(server["models"])} for server in found
+        ],
+    }
 
 
 # ── Инструменты ────────────────────────────────────────────────────────────
@@ -509,6 +690,63 @@ async def update_rules(config: RulesConfig):
 def disconnect_serial():
     serial_manager.pause_reconnect(60.0)
     return {"status": "success", "message": "Serial освобождён на 60 секунд (для прошивки)"}
+
+
+async def device_watchdog() -> None:
+    """Следит за физическим подключением питомца и сообщает об этом панели.
+
+    Питомец может быть на связи двумя путями (Wi-Fi и USB), и раньше индикатор
+    в панели зажигался только от пакета device_status. Если устройство молчит,
+    но кабель воткнут, панель всё равно должна показывать «на связи».
+    """
+    while True:
+        try:
+            on_usb = serial_manager.is_connected
+            on_wifi = manager.device_on_wifi
+
+            if on_wifi:
+                changed = manager.mark_device_seen("wifi")
+            elif on_usb:
+                changed = manager.mark_device_seen("usb")
+            else:
+                changed = manager.mark_device_gone()
+
+            if changed:
+                logger.info(
+                    "Питомец "
+                    + ("на связи по Wi-Fi" if on_wifi else "на связи по USB" if on_usb else "отключён")
+                )
+                await bus.emit("device_status_update", device_info=manager.device_info)
+        except asyncio.CancelledError:
+            break
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"Ошибка наблюдателя за устройством: {e}")
+        await asyncio.sleep(2)
+
+
+async def update_watchdog() -> None:
+    """Раз в сутки проверяет, не вышла ли новая версия.
+
+    Первую проверку откладываем: при старте и так поднимаются MCP-серверы,
+    модель распознавания и устройство — лишний сетевой запрос там ни к чему.
+    """
+    await asyncio.sleep(30)
+    while True:
+        try:
+            if settings_store.get("auto_check_updates", True):
+                state = await updater.check()
+                if updater.should_notify:
+                    await bus.emit(
+                        "update_available",
+                        version=state.available.version,
+                        notes=state.available.notes,
+                        installable=state.installable,
+                    )
+        except asyncio.CancelledError:
+            break
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"Проверка обновлений: {e}")
+        await asyncio.sleep(3600)
 
 
 def ensure_serial_reader() -> None:

@@ -17,8 +17,10 @@ from ai.tools.base import ToolError, registry
 
 logger = logging.getLogger("ai.tools.productivity")
 
-BACKEND_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-DATA_DIR = os.path.join(BACKEND_DIR, "data")
+from core import paths
+
+BACKEND_DIR = paths.DATA_ROOT
+DATA_DIR = paths.data("data")
 NOTES_FILE = os.path.join(DATA_DIR, "notes.json")
 REMINDERS_FILE = os.path.join(DATA_DIR, "reminders.json")
 
@@ -93,7 +95,16 @@ class ReminderArgs(BaseModel):
     risk="safe",
     category="productivity",
 )
-def set_reminder(message: str, minutes: int = 0, at_time: str = "") -> str:
+# Функция асинхронная НАМЕРЕННО, хотя внутри нет ни одного await.
+# Реестр инструментов теперь уводит синхронные функции в asyncio.to_thread
+# (чтобы медленный инструмент не рвал звук), а в рабочем потоке нет
+# запущенного цикла событий — asyncio.create_task ниже упал бы с
+# RuntimeError: no running event loop. Из двух решений (async def или
+# захват цикла заранее + call_soon_threadsafe) выбрано первое: работы здесь
+# на доли миллисекунды, блокировать цикл нечем, а код остаётся прямым —
+# создание задачи и словарь _reminder_tasks живут в одном потоке, значит
+# и cancel_reminder не нуждается в потокобезопасной синхронизации.
+async def set_reminder(message: str, minutes: int = 0, at_time: str = "") -> str:
     if not message.strip():
         raise ToolError("Не указан текст напоминания.")
 
@@ -154,7 +165,9 @@ class CancelReminderArgs(BaseModel):
     risk="safe",
     category="productivity",
 )
-def cancel_reminder(reminder_id: str) -> str:
+# Тоже асинхронная по той же причине: Task.cancel() не потокобезопасен,
+# его нельзя звать из рабочего потока asyncio.to_thread.
+async def cancel_reminder(reminder_id: str) -> str:
     items = _read_json(REMINDERS_FILE, [])
     rest = [r for r in items if r["id"] != reminder_id]
     if len(rest) == len(items):

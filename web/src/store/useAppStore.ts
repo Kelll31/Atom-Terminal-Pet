@@ -71,6 +71,21 @@ export interface AgentStatus {
   step?: number;
 }
 
+export interface VoiceState {
+  /** человек сейчас говорит (сработал детектор речи) */
+  speaking: boolean;
+  /** громкость с микрофона, 0..1 */
+  level: number;
+  /** фоновый шум комнаты, 0..1 */
+  noiseFloor: number;
+  /** открыт ли живой диалог (можно говорить без обращения по имени) */
+  conversationOpen: boolean;
+  conversationLeft: number;
+  /** питомец сейчас говорит */
+  petSpeaking: boolean;
+  lastIgnored: string;
+}
+
 interface AppState {
   isConnected: boolean;
   metrics: PCMetrics;
@@ -82,6 +97,7 @@ interface AppState {
   tasks: Task[];
   approvals: Approval[];
   agentStatus: AgentStatus;
+  voice: VoiceState;
 
   connectWebSocket: () => void;
   disconnectWebSocket: () => void;
@@ -94,6 +110,7 @@ interface AppState {
   resolveApproval: (id: string, decision: 'allow' | 'allow_always' | 'deny') => void;
   cancelTask: (taskId: string) => void;
   resetChat: () => void;
+  interruptPet: () => void;
 
   audioListeners: ((data: ArrayBuffer) => void)[];
   addAudioListener: (fn: (data: ArrayBuffer) => void) => void;
@@ -133,6 +150,15 @@ export const useAppStore = create<AppState>((set, get) => ({
   tasks: [],
   approvals: [],
   agentStatus: { state: 'idle' },
+  voice: {
+    speaking: false,
+    level: 0,
+    noiseFloor: 0,
+    conversationOpen: false,
+    conversationLeft: 0,
+    petSpeaking: false,
+    lastIgnored: '',
+  },
   audioListeners: [],
 
   connectWebSocket: () => {
@@ -194,7 +220,7 @@ export const useAppStore = create<AppState>((set, get) => ({
                 history.push({ id: `${Date.now()}-${history.length}`, sender: 'agent', text: data.text });
                 return { chatHistory: history.slice(-60) };
               });
-              get().addLog(`Атом: ${data.text}`);
+              get().addLog(`Патрик: ${data.text}`);
             }
           }
           break;
@@ -204,6 +230,34 @@ export const useAppStore = create<AppState>((set, get) => ({
           set({ agentStatus: { state: data.state, tool: data.tool, step: data.step } });
           if (data.state === 'thinking') set({ emotion: 'thinking' });
           if (data.state === 'working') set({ emotion: 'working' });
+          set(state => ({ voice: { ...state.voice, petSpeaking: data.state === 'speaking' } }));
+          break;
+
+        case 'voice_state':
+          set(state => ({
+            voice: {
+              ...state.voice,
+              speaking: !!data.speaking,
+              level: data.level ?? state.voice.level,
+              noiseFloor: data.noise_floor ?? state.voice.noiseFloor,
+              conversationOpen: !!data.conversation_open,
+              conversationLeft: data.conversation_left ?? 0,
+            },
+          }));
+          break;
+
+        case 'voice_interrupted':
+          set(state => ({ voice: { ...state.voice, petSpeaking: false } }));
+          get().addLog(`Питомца перебили (${data.reason})`);
+          break;
+
+        case 'voice_ignored':
+          set(state => ({ voice: { ...state.voice, lastIgnored: data.text } }));
+          break;
+
+        case 'pet_touched':
+          set({ emotion: 'love' });
+          get().addLog(`Питомца погладили (${data.source})`);
           break;
 
         case 'tasks_snapshot':
@@ -316,6 +370,11 @@ export const useAppStore = create<AppState>((set, get) => ({
   },
 
   cancelTask: (taskId) => get().sendMessage({ action: 'cancel_task', task_id: taskId }),
+
+  interruptPet: () => {
+    set(state => ({ voice: { ...state.voice, petSpeaking: false } }));
+    get().sendMessage({ action: 'interrupt', reason: 'panel' });
+  },
 
   resetChat: () => {
     set({ chatHistory: [], tasks: [] });

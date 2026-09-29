@@ -1,3 +1,13 @@
+"""Реестр WebSocket-клиентов и маршрутизация по ним.
+
+Ключевая идея: питомец — НЕ ещё одна панель. У прошивки в разы более узкое
+горло (буфер команды в пару килобайт, экран 128x128 без кириллицы, скромный
+heap), поэтому «разослать всем» для неё смертельно: снимок задач на 15+ КБ
+рвёт соединение кодом 1009, а браузерный микрофон из тестера превращается
+в шум из динамика. Поэтому все broadcast_* здесь означают «всем панелям»,
+а для устройства есть отдельные адресные send_to_device / send_binary_to_device.
+"""
+
 import logging
 import time
 
@@ -48,6 +58,31 @@ class ConnectionManager:
         self.device_ws = websocket
         self.device_info["transport"] = "wifi"
 
+    def mark_device_seen(self, transport: str) -> bool:
+        """Питомец только что прислал данные. Возвращает True, если состояние изменилось.
+
+        Нужно потому, что по USB старые прошивки не представляются пакетом
+        device_status — раньше панель в упор не видела подключённого питомца,
+        хотя звук с его микрофона исправно шёл.
+        """
+        changed = (
+            not self.device_info["connected"] or self.device_info["transport"] != transport
+        )
+        self.device_info["connected"] = True
+        self.device_info["transport"] = transport
+        self.device_info["last_seen"] = time.strftime("%H:%M:%S")
+        if transport == "usb" and self.device_info["ip"] in ("Not Connected", "Оффлайн"):
+            self.device_info["ip"] = "USB"
+            self.device_info["ssid"] = "—"
+        return changed
+
+    def mark_device_gone(self) -> bool:
+        if not self.device_info["connected"]:
+            return False
+        self.device_info["connected"] = False
+        self.device_info["transport"] = "none"
+        return True
+
     @property
     def device_on_wifi(self) -> bool:
         return self.device_ws is not None and self.device_ws in self.active_connections
@@ -80,18 +115,67 @@ class ConnectionManager:
             logger.error(f"Error sending binary: {e}")
             self.disconnect(websocket)
 
+    # ── рассылка по панелям ────────────────────────────────────────────────
+    def panel_connections(self) -> list[WebSocket]:
+        """Все клиенты, кроме самого питомца.
+
+        Отдельный список нужен потому, что панель и устройство хотят разного:
+        панели — весь поток событий целиком, устройству — только то, что оно
+        понимает, и только в укороченном виде (см. EventBus._device_message).
+        """
+        return [ws for ws in self.active_connections if ws is not self.device_ws]
+
     async def broadcast_json(self, message: dict):
-        for connection in list(self.active_connections):
+        """JSON всем панелям. Устройство сюда НЕ попадает намеренно."""
+        for connection in self.panel_connections():
             await self.send_json(message, connection)
 
     async def broadcast_binary(self, data: bytes):
-        for connection in list(self.active_connections):
+        """Бинарный кадр всем панелям (осциллограф, запись, отладка звука)."""
+        for connection in self.panel_connections():
             await self.send_binary(data, connection)
 
     async def broadcast_binary_exclude(self, data: bytes, exclude_ws: WebSocket):
-        for connection in list(self.active_connections):
-            if connection != exclude_ws:
+        """То же, но без отправителя — чтобы микрофон не возвращался ему эхом.
+
+        Устройство исключено и здесь: иначе браузерный микрофон из тестера
+        PCMicTester уходил бы прямиком в динамик питомца.
+        """
+        for connection in self.panel_connections():
+            if connection is not exclude_ws:
                 await self.send_binary(data, connection)
+
+    # ── адресная отправка питомцу ──────────────────────────────────────────
+    async def send_to_device(self, message: dict) -> bool:
+        """Команда лично питомцу по Wi-Fi.
+
+        Возвращает False, если устройства по Wi-Fi нет или отправка не удалась,
+        — вызывающий код (шина событий) по этому признаку решает, не переслать
+        ли команду по USB.
+        """
+        websocket = self.device_ws
+        if websocket is None or websocket not in self.active_connections:
+            return False
+        try:
+            await websocket.send_json(message)
+            return True
+        except Exception as e:
+            logger.error(f"Не удалось отправить команду питомцу: {e}")
+            self.disconnect(websocket)
+            return False
+
+    async def send_binary_to_device(self, data: bytes) -> bool:
+        """Аудио-чанк лично питомцу по Wi-Fi. Возвращает False, если не дошло."""
+        websocket = self.device_ws
+        if websocket is None or websocket not in self.active_connections:
+            return False
+        try:
+            await websocket.send_bytes(data)
+            return True
+        except Exception as e:
+            logger.error(f"Не удалось отправить аудио питомцу: {e}")
+            self.disconnect(websocket)
+            return False
 
 
 manager = ConnectionManager()

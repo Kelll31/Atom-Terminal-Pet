@@ -1,4 +1,4 @@
-"""Очередь задач Атома.
+"""Очередь задач Патрика.
 
 Пользователь ставит задачу (голосом или из web-панели) — она попадает в очередь
 и выполняется по одной, чтобы питомец не говорил двумя голосами одновременно.
@@ -118,6 +118,7 @@ class TaskManager:
         self.worker: asyncio.Task | None = None
         self.current: Task | None = None
         self._running_task: asyncio.Task | None = None
+        self._silent_cancel = False  # отмена по перебиванию — без комментария вслух
 
         # Подтверждения
         self.pending_approvals: dict[str, dict[str, Any]] = {}
@@ -152,6 +153,18 @@ class TaskManager:
 
     def list(self) -> list[dict[str, Any]]:
         return [t.dict() for t in list(self.tasks.values())[::-1]]
+
+    async def cancel_current(self) -> bool:
+        """Остановить то, чем питомец занят прямо сейчас (перебивание голосом/кнопкой).
+
+        Молча: человек перебил, потому что хочет говорить сам — комментарий
+        «отменил задачу» здесь только мешает.
+        """
+        task = self.current
+        if task is None:
+            return False
+        self._silent_cancel = True
+        return await self.cancel(task.id)
 
     async def cancel(self, task_id: str) -> bool:
         task = self.tasks.get(task_id)
@@ -247,7 +260,11 @@ class TaskManager:
                 task.status = "cancelled"
                 task.finished = time.time()
                 await self.publish(task)
-                await bus.speak("Отменил задачу.", emotion="sad")
+                if self._silent_cancel:
+                    self._silent_cancel = False
+                    await bus.set_emotion("listening", "")
+                else:
+                    await bus.speak("Отменил задачу.", emotion="sad")
             finally:
                 self.current = None
                 self._running_task = None
@@ -260,14 +277,32 @@ class TaskManager:
 
         ctx = TaskContext(task, self)
         try:
-            result = await agent.run(task.text, ctx)
+            speech_id = bus.begin_speech()
+
+            # Голосовые задачи отвечают потоково: питомец начинает говорить,
+            # не дожидаясь конца генерации. Для задач из панели это не нужно.
+            speaker = None
+            if task.source == "voice" and settings_store.get("speak_replies", True):
+                async def speaker(sentence: str) -> None:
+                    await bus.emit("agent_status", state="speaking")
+                    await bus.speak_sentence(sentence, speech_id)
+
+            result = await agent.run(task.text, ctx, speaker=speaker)
             task.result = result
             task.status = "done"
             task.finished = time.time()
             await self.publish(task)
+
+            already_spoken = getattr(agent, "spoken_while_streaming", False)
             await bus.emit("agent_status", state="speaking")
-            await bus.speak(result, emotion="happy")
-            await bus.set_emotion("listening", "Listening...")
+            await bus.speak(result, emotion="happy", voice=not already_spoken)
+
+            # Живой диалог: после ответа можно продолжать без обращения по имени
+            from ai.voice import voice_pipeline
+
+            voice_pipeline.open_conversation()
+            await bus.emit("agent_status", state="idle")
+            await bus.set_emotion("listening", "")
         except AgentUnavailable as e:
             task.status = "failed"
             task.error = str(e)

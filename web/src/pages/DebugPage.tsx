@@ -55,14 +55,14 @@ const DebugPage: React.FC = () => {
 
         {/* Wake Word / Pet Name Test */}
         <div className="bg-cyber-navy/40 border border-cyber-navy p-6 rounded-xl space-y-4">
-          <h3 className="text-sm font-bold text-yellow-400 uppercase tracking-wider">Проверка клички ("Атом" / "Микро")</h3>
+          <h3 className="text-sm font-bold text-yellow-400 uppercase tracking-wider">Проверка клички ("Патрик" / "Микро")</h3>
           <div className="flex flex-col gap-2">
             <button
               disabled={!isConnected}
-              onClick={() => sendMessage({ action: 'user_text', text: 'Атом!' })}
+              onClick={() => sendMessage({ action: 'user_text', text: 'Патрик!' })}
               className="w-full py-2 bg-cyber-dark border border-yellow-500/40 text-yellow-400 hover:bg-yellow-500/10 rounded text-xs transition-colors disabled:opacity-50"
             >
-              Позвать: "Атом!"
+              Позвать: "Патрик!"
             </button>
             <button
               disabled={!isConnected}

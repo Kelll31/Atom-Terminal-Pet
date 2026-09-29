@@ -61,7 +61,7 @@ function App() {
             <Link to="/dashboard" className="flex shrink-0 items-center gap-2">
               <PatrickPet emotion={emotion} size="sm" showLabel={false} />
               <div className="hidden leading-tight md:block">
-                <div className="text-sm font-bold text-white">Атом</div>
+                <div className="text-sm font-bold text-white">Патрик</div>
                 <div className="text-[11px] text-slate-500">питомец-помощник</div>
               </div>
             </Link>

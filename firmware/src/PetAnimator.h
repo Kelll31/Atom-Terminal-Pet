@@ -1,5 +1,8 @@
 #pragma once
 #include <M5Unified.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
+#include "Config.h"
 #include "PetFace.h"
 #include "PetState.h"
 
@@ -16,9 +19,14 @@ class PetAnimator {
 public:
     PetAnimator();
 
-    void init();
+    bool init();                                  // false — не хватило памяти на спрайт
     void updateTargets(float pitch, float roll);  // считает целевую позу
     void renderFrame();                           // рисует кадр в спрайт и выводит на экран
+
+    // Поворот применяет сама задача отрисовки. Если менять его из основного
+    // цикла, команда уходит на дисплей посреди выталкивания кадра — по шине
+    // идут две транзакции сразу.
+    void requestRotation(int rotation) { pendingRotation = rotation & 3; }
 
     // Экраны
     void setScreen(PetScreen screen);
@@ -50,6 +58,8 @@ private:
 
     PetScreen screen;
     uint32_t screenChangedAt;
+    volatile int pendingRotation;   // -1 — менять нечего
+    int appliedRotation;
 
     // Микроанимации
     float saccadeX, saccadeY;
@@ -61,8 +71,11 @@ private:
     // Внешние данные
     float audioLevel;
     float micLevel;
+    // Реплику ставит основной цикл, а читает задача отрисовки — поэтому под
+    // замком. Без него на экране изредка появлялась склейка двух фраз.
+    SemaphoreHandle_t bubbleLock;
     char bubbleText[128];
-    uint32_t bubbleUntil;
+    volatile uint32_t bubbleUntil;
     char ssidText[33];
     char ipText[17];
     char petName[17];

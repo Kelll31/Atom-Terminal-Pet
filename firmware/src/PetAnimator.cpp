@@ -1,6 +1,6 @@
 #include "PetAnimator.h"
 #include "PCTracker.h"
-#include "HardwareIO.h"
+#include "AudioIO.h"
 #include "Sensors.h"
 #include <math.h>
 #include <time.h>
@@ -13,10 +13,10 @@ static inline float clampf(float v, float lo, float hi) { return v < lo ? lo : (
 PetAnimator::PetAnimator()
     : canvas(&M5.Display),
       lastEmotion(PetEmotion::INIT), emotionChangedAt(0),
-      screen(PetScreen::FACE), screenChangedAt(0),
+      screen(PetScreen::FACE), screenChangedAt(0), pendingRotation(0), appliedRotation(-1),
       saccadeX(0), saccadeY(0), nextSaccadeTime(0),
       blinking(false), nextBlinkTime(0), pokeEnergy(0),
-      audioLevel(0), micLevel(0), bubbleUntil(0), rssi(0),
+      audioLevel(0), micLevel(0), bubbleLock(nullptr), bubbleUntil(0), rssi(0),
       micMuted(false), wifiOk(false), serverOk(false), sensorsOk(false), clockValid(false),
       historyIndex(0), lastHistoryTime(0), fps(0), lastFrameTime(0) {
     bubbleText[0] = '\0';
@@ -27,11 +27,19 @@ PetAnimator::PetAnimator()
     memset(ramHistory, 0, sizeof(ramHistory));
 }
 
-void PetAnimator::init() {
-    canvas.setPsram(true);
-    canvas.createSprite(128, 128);
+bool PetAnimator::init() {
+    bubbleLock = xSemaphoreCreateMutex();
+
+    // Кадр держим во внутренней памяти. 32 КБ она переживает спокойно, а вот
+    // выталкивание спрайта из PSRAM стоит примерно четверти кадров в секунду.
+    canvas.setPsram(false);
+    if (!canvas.createSprite(SCREEN_W, SCREEN_H)) {
+        canvas.setPsram(true);
+        if (!canvas.createSprite(SCREEN_W, SCREEN_H)) return false;
+    }
     canvas.setTextWrap(false);
     nextBlinkTime = millis() + random(2000, 5000);
+    return true;
 }
 
 void PetAnimator::setScreen(PetScreen next) {
@@ -45,15 +53,19 @@ void PetAnimator::nextScreen() {
 
 void PetAnimator::showBubble(const char* text, uint32_t durationMs) {
     if (!text || !text[0]) return;
+    if (bubbleLock) xSemaphoreTake(bubbleLock, portMAX_DELAY);
     strncpy(bubbleText, text, sizeof(bubbleText) - 1);
     bubbleText[sizeof(bubbleText) - 1] = '\0';
     bubbleUntil = millis() + durationMs;
+    if (bubbleLock) xSemaphoreGive(bubbleLock);
     screen = PetScreen::FACE;  // реплику всегда показываем на мордочке
 }
 
 void PetAnimator::clearBubble() {
+    if (bubbleLock) xSemaphoreTake(bubbleLock, portMAX_DELAY);
     bubbleText[0] = '\0';
     bubbleUntil = 0;
+    if (bubbleLock) xSemaphoreGive(bubbleLock);
 }
 
 void PetAnimator::setNetworkInfo(const char* ssid, const char* ip, int strength) {
@@ -285,6 +297,14 @@ void PetAnimator::smoothPose() {
 // ── Кадр ────────────────────────────────────────────────────────────────────
 void PetAnimator::renderFrame() {
     uint32_t now = millis();
+
+    // Поворот меняем здесь же, между кадрами: шина дисплея принадлежит
+    // этой задаче и только ей.
+    if (pendingRotation != appliedRotation) {
+        appliedRotation = pendingRotation;
+        M5.Display.setRotation(appliedRotation);
+    }
+
     smoothPose();
     pushHistory(now);
 
@@ -322,7 +342,7 @@ void PetAnimator::drawStatusStrip() {
         canvas.fillSmoothCircle(18, 6, 3, bad);
         canvas.drawLine(15, 3, 21, 9, canvas.color565(255, 255, 255));
     } else {
-        int level = (int)(hardwareIO.getMicLevel() * 6);
+        int level = (int)(audioIO.micLevel() * 6);
         canvas.fillSmoothCircle(18, 6, 2 + (level > 2 ? 2 : level), ok);
     }
 
@@ -337,7 +357,16 @@ void PetAnimator::drawStatusStrip() {
 
 // ── Реплика ─────────────────────────────────────────────────────────────────
 void PetAnimator::drawBubble() {
-    if (!bubbleText[0] || millis() > bubbleUntil) return;
+    if (millis() > bubbleUntil) return;
+
+    // Снимаем копию под замком: пока рисуем, основной цикл может подставить
+    // следующую реплику, и на экране получилась бы склейка двух фраз.
+    char text[sizeof(bubbleText)];
+    if (bubbleLock) xSemaphoreTake(bubbleLock, portMAX_DELAY);
+    strncpy(text, bubbleText, sizeof(text) - 1);
+    text[sizeof(text) - 1] = '\0';
+    if (bubbleLock) xSemaphoreGive(bubbleLock);
+    if (!text[0]) return;
 
     canvas.setTextSize(1);
     canvas.setTextDatum(top_left);
@@ -350,7 +379,7 @@ void PetAnimator::drawBubble() {
     int lineLen = 0;
     lines[0][0] = '\0';
 
-    const char* p = bubbleText;
+    const char* p = text;
     char word[24];
     while (*p && lineCount < 3) {
         int wl = 0;
@@ -512,17 +541,23 @@ void PetAnimator::renderInfoScreen(uint32_t now) {
 
     uint16_t ok  = canvas.color565(90, 230, 150);
     uint16_t bad = canvas.color565(255, 110, 110);
+    uint16_t dim = canvas.color565(120, 130, 150);
 
-    line(24, "WiFi",  wifiOk ? ssidText : "нет", wifiOk ? ok : bad);
+    // Строго ASCII: встроенный шрифт LovyanGFX кириллицу не содержит,
+    // и «нет» превращалось на экране в пару случайных глифов.
+    const bool audioOk = audioIO.isReady();
+    const bool psramOk = psramFound();
+
+    line(24, "WiFi",  wifiOk ? ssidText : "-", wifiOk ? ok : bad);
     line(36, "IP",    ipText, canvas.color565(200, 210, 230));
     line(48, "Server", serverOk ? "online" : "offline", serverOk ? ok : bad);
     line(60, "Mic",   micMuted ? "muted" : "live", micMuted ? bad : ok);
-    line(72, "Audio", hardwareIO.isAudioReady() ? "ES8311" : "нет", hardwareIO.isAudioReady() ? ok : bad);
-    line(84, "Sense", sensorsOk ? "LTR553" : "нет", sensorsOk ? ok : canvas.color565(120, 130, 150));
-    line(96, "PSRAM", hardwareIO.hasPsram() ? "8 MB" : "нет", hardwareIO.hasPsram() ? ok : bad);
+    line(72, "Audio", audioOk ? "ES8311" : "fail", audioOk ? ok : bad);
+    line(84, "Sense", sensorsOk ? "LTR553" : "none", sensorsOk ? ok : dim);
+    line(96, "PSRAM", psramOk ? "8 MB" : "none", psramOk ? ok : dim);
 
-    char buf[24];
-    snprintf(buf, sizeof(buf), "%d fps  %d dBm", (int)fps, rssi);
+    char buf[32];
+    snprintf(buf, sizeof(buf), "%d fps %ddBm %dk", (int)fps, rssi, (int)(ESP.getFreeHeap() / 1024));
     canvas.setTextColor(canvas.color565(100, 110, 130));
     canvas.drawString(buf, 6, 112);
 }

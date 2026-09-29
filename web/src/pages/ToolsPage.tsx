@@ -74,7 +74,7 @@ const ToolsPage: React.FC = () => {
       setServers((await serversRes.json()).servers ?? []);
       setAudit((await auditRes.json()).entries ?? []);
     } catch {
-      setNotice('Не удалось связаться с сервером Атома.');
+      setNotice('Не удалось связаться с сервером Патрика.');
     }
   }, []);
 
@@ -166,7 +166,7 @@ const ToolsPage: React.FC = () => {
       <header>
         <h1 className="text-2xl font-bold text-white">Инструменты и MCP</h1>
         <p className="mt-1 text-sm text-slate-400">
-          Всё, чем Атом может пользоваться на вашем компьютере. Ненужное можно выключить,
+          Всё, чем Патрик может пользоваться на вашем компьютере. Ненужное можно выключить,
           а внешние MCP-серверы — подключить в один клик.
         </p>
       </header>
@@ -337,7 +337,7 @@ const ToolsPage: React.FC = () => {
         </h2>
         <div className="card divide-y divide-white/5 overflow-hidden">
           {audit.length === 0 ? (
-            <p className="p-4 text-sm text-slate-500">Атом ещё ничего не запускал.</p>
+            <p className="p-4 text-sm text-slate-500">Патрик ещё ничего не запускал.</p>
           ) : (
             audit.map((entry, index) => (
               <div key={`${entry.ts}-${index}`} className="flex flex-wrap items-center gap-2 px-4 py-2 text-xs">

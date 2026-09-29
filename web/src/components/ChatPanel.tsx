@@ -51,7 +51,7 @@ export const ChatPanel: React.FC = () => {
         {chatHistory.length === 0 ? (
           <div className="flex h-full flex-col items-center justify-center gap-4 text-center">
             <p className="max-w-sm text-sm text-slate-400">
-              Скажите «Атом, …» в микрофон питомца или напишите задачу здесь — он выполнит её сам.
+              Скажите «Патрик, …» в микрофон питомца или напишите задачу здесь — он выполнит её сам.
             </p>
             <div className="flex flex-wrap justify-center gap-2">
               {QUICK_TASKS.map(task => (
@@ -73,7 +73,7 @@ export const ChatPanel: React.FC = () => {
               className={`flex flex-col ${message.sender === 'user' ? 'items-end' : 'items-start'}`}
             >
               <span className="mb-1 px-1 text-[11px] font-medium tracking-wide text-slate-500">
-                {message.sender === 'user' ? 'ВЫ' : 'АТОМ'}
+                {message.sender === 'user' ? 'ВЫ' : 'Патрик'}
               </span>
               <div
                 className={`max-w-[85%] whitespace-pre-wrap rounded-2xl px-4 py-2.5 text-sm leading-relaxed ${
@@ -117,7 +117,7 @@ export const ChatPanel: React.FC = () => {
           value={draft}
           onChange={(event) => setDraft(event.target.value)}
           disabled={!isConnected}
-          placeholder={isConnected ? 'Поставьте задачу Атому…' : 'Нет связи с сервером'}
+          placeholder={isConnected ? 'Поставьте задачу Патрику…' : 'Нет связи с сервером'}
           className="field flex-1"
         />
         <button type="submit" disabled={!isConnected || !draft.trim()} className="btn-primary px-4">

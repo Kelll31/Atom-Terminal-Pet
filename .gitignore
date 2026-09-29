@@ -227,3 +227,8 @@ __marimo__/
 /backend/logs/
 /web/node_modules
 /web/dist
+
+# Сборка приложения для Windows (packaging/build.ps1)
+# Иконка генерируется из backend/tray_icon.py, поэтому в репозитории не нужна.
+packaging/out/
+packaging/atompet.ico

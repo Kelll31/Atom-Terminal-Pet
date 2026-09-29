@@ -8,10 +8,10 @@ from core.settings import settings_store
 
 def test_wake_word_detection(monkeypatch):
     monkeypatch.setattr(settings_store.current, "require_wake_word", True)
-    monkeypatch.setattr(settings_store.current, "pet_name", "Атом")
-    monkeypatch.setattr(settings_store.current, "wake_words", ["атом", "atom"])
+    monkeypatch.setattr(settings_store.current, "pet_name", "Патрик")
+    monkeypatch.setattr(settings_store.current, "wake_words", ["Патрик", "atom"])
 
-    assert is_wake_word_present("Атом, открой проект")
+    assert is_wake_word_present("Патрик, открой проект")
     assert is_wake_word_present("эй atom что там с диском")
     assert not is_wake_word_present("надо бы кофе выпить")
 
@@ -94,6 +94,70 @@ async def test_agent_executes_tool_then_answers(monkeypatch):
     assert [kind for kind, _ in ctx.steps] == ["tool_call", "tool_result"]
     assert ctx.steps[1][1]["ok"] is True
     assert len(agent.history) == 2
+
+
+class StreamingLLM:
+    """Модель, отдающая ответ по кускам, как настоящий провайдер."""
+
+    def __init__(self, pieces):
+        self.pieces = pieces
+
+    async def astream(self, messages):
+        from langchain_core.messages import AIMessageChunk
+
+        for piece in self.pieces:
+            yield AIMessageChunk(content=piece)
+
+    async def ainvoke(self, messages):
+        return AIMessage(content="".join(self.pieces))
+
+
+async def test_agent_speaks_sentences_while_model_still_writes(monkeypatch):
+    """Живой режим: первое предложение звучит до конца генерации."""
+    llm = StreamingLLM(["Готово. ", "Нашёл два ", "процесса. ", "Что дальше?"])
+    monkeypatch.setattr("ai.agent.build_llm", lambda with_tools=True: llm)
+
+    spoken: list[str] = []
+
+    async def speaker(sentence: str) -> None:
+        spoken.append(sentence)
+
+    agent = AtomAgent()
+    result = await agent.run("что там с процессами", RecordingContext(), speaker=speaker)
+
+    assert spoken[0] == "Готово."
+    assert "Что дальше?" in spoken[-1]
+    assert agent.spoken_while_streaming is True
+    assert result.startswith("Готово.")
+
+
+async def test_agent_does_not_speak_when_tools_are_called(monkeypatch):
+    """Если модель решила вызвать инструмент — сначала дело, а не болтовня."""
+    from langchain_core.messages import AIMessageChunk
+
+    class ToolStreamLLM:
+        async def astream(self, messages):
+            yield AIMessageChunk(
+                content="",
+                tool_call_chunks=[
+                    {"name": "recall", "args": "{}", "id": "c1", "index": 0, "type": "tool_call_chunk"}
+                ],
+            )
+
+        async def ainvoke(self, messages):
+            return AIMessage(content="", tool_calls=[{"name": "recall", "args": {}, "id": "c1"}])
+
+    monkeypatch.setattr("ai.agent.build_llm", lambda with_tools=True: ToolStreamLLM())
+    monkeypatch.setattr(settings_store.current, "max_steps", 1)
+
+    spoken: list[str] = []
+
+    async def speaker(sentence: str) -> None:
+        spoken.append(sentence)
+
+    agent = AtomAgent()
+    await agent.run("вспомни всё", RecordingContext(), speaker=speaker)
+    assert spoken == []
 
 
 async def test_agent_stops_on_step_limit(monkeypatch):

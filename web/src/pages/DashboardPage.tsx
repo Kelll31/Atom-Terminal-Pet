@@ -6,6 +6,7 @@ import { MicStreamPlayer } from '../components/MicStreamPlayer';
 import { PCMicTester } from '../components/PCMicTester';
 import { ChatPanel } from '../components/ChatPanel';
 import { TaskTimeline } from '../components/TaskTimeline';
+import { VoiceBar } from '../components/VoiceBar';
 
 const MetricTile: React.FC<{
   label: string;
@@ -86,6 +87,9 @@ const DashboardPage: React.FC = () => {
         </div>
       </div>
 
+      {/* Голосовой режим */}
+      <VoiceBar />
+
       {/* Метрики */}
       <div className="grid grid-cols-2 gap-4 lg:grid-cols-4">
         <MetricTile label="Процессор" value={metrics.cpu} icon={Cpu} accent="text-cyber-cyan" danger={metrics.cpu > 90} />
@@ -107,7 +111,7 @@ const DashboardPage: React.FC = () => {
 
       {/* Что делает агент */}
       <section className="space-y-3">
-        <h2 className="text-sm font-semibold uppercase tracking-widest text-slate-400">Что делает Атом</h2>
+        <h2 className="text-sm font-semibold uppercase tracking-widest text-slate-400">Что делает Патрик</h2>
         <TaskTimeline
           tasks={tasks.slice(0, 8)}
           emptyHint="Поставьте задачу в диалоге — здесь появятся шаги её выполнения."

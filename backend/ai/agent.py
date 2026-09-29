@@ -1,4 +1,4 @@
-"""Агент Атома: цикл «модель ↔ инструменты».
+"""Агент Патрика: цикл «модель ↔ инструменты».
 
 Модель получает список инструментов (локальные + MCP) и сама решает, что вызвать.
 Каждый вызов проходит через реестр: проверка прав, подтверждение опасных действий,
@@ -17,14 +17,17 @@ from typing import Any
 import yaml
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
 
+from ai import llm as llm_backend
 from ai.tools import registry
 from ai.tools.productivity import load_memory_digest
 from core.settings import settings_store
 
 logger = logging.getLogger("ai.agent")
 
-BACKEND_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-PROMPTS_FILE = os.path.join(BACKEND_DIR, "config", "prompts.yaml")
+from core import paths
+
+BACKEND_DIR = paths.DATA_ROOT
+PROMPTS_FILE = paths.resource("backend", "config", "prompts.yaml")
 
 FALLBACK_PROMPT = (
     "Ты — {pet_name}, кибер-питомец и помощник программиста, живущий в M5Stack AtomS3R. "
@@ -32,8 +35,9 @@ FALLBACK_PROMPT = (
 )
 
 NO_KEY_MESSAGE = (
-    "Мозг не подключён: не задан API-ключ модели. Открой web-панель, вкладка «Настройки», "
-    "укажи ключ и модель — и я снова смогу думать."
+    "Мозг не подключён: не задан ни API-ключ, ни адрес локальной модели. Открой web-панель, "
+    "вкладка «Настройки»: либо укажи ключ облачной модели, либо нажми «Найти локальную модель», "
+    "если у тебя запущен LM Studio, Bionic или Ollama."
 )
 
 
@@ -91,24 +95,15 @@ def load_system_prompt(pc_context: dict[str, Any]) -> str:
 
 
 def build_llm(with_tools: bool = True):
-    from langchain_openai import ChatOpenAI
-
     settings = settings_store.current
-    if not settings.api_key:
+    if llm_backend.needs_api_key(settings.api_key, settings.base_url):
         raise AgentUnavailable(NO_KEY_MESSAGE)
 
-    headers = {}
-    if settings.base_url and "openrouter.ai" in settings.base_url.lower():
-        headers = {"HTTP-Referer": "http://localhost:8000", "X-Title": "Atom-Terminal-Pet"}
-
-    llm = ChatOpenAI(
+    llm = llm_backend.build_chat_model(
         api_key=settings.api_key,
-        base_url=settings.base_url or None,
-        model=settings.model_name or "gpt-4o-mini",
+        base_url=settings.base_url,
+        model=settings.model_name,
         temperature=settings.temperature,
-        timeout=90,
-        max_retries=2,
-        default_headers=headers,
     )
 
     if with_tools:
@@ -123,12 +118,19 @@ class AtomAgent:
 
     def __init__(self, history_limit: int = 16) -> None:
         self.history: deque[BaseMessage] = deque(maxlen=history_limit)
+        # Ответ уже прозвучал по ходу генерации — повторно озвучивать не нужно
+        self.spoken_while_streaming = False
 
     def reset(self) -> None:
         self.history.clear()
 
-    async def run(self, user_text: str, ctx: Any) -> str:
-        """Выполняет задачу пользователя. ctx — контекст задачи (шаги, подтверждения)."""
+    async def run(self, user_text: str, ctx: Any, speaker: Any = None) -> str:
+        """Выполняет задачу пользователя.
+
+        ctx     — контекст задачи (шаги, подтверждения);
+        speaker — необязательный колбэк: получает готовые предложения ответа
+                  ещё до окончания генерации, чтобы питомец начал говорить сразу.
+        """
         from monitor.pc_monitor import pc_monitor
 
         settings = settings_store.current
@@ -140,11 +142,15 @@ class AtomAgent:
         messages.append(HumanMessage(content=user_text))
 
         final_text = ""
+        self.spoken_while_streaming = False
+
         for step in range(settings.max_steps):
             await ctx.emit("agent_status", state="thinking", step=step + 1)
 
             try:
-                ai_msg: AIMessage = await llm.ainvoke(messages)
+                ai_msg = await self._invoke(llm, messages, speaker)
+            except AgentUnavailable:
+                raise
             except Exception as e:  # noqa: BLE001
                 logger.error(f"Ошибка обращения к модели: {e}")
                 raise AgentUnavailable(f"Модель недоступна: {e}") from e
@@ -188,6 +194,59 @@ class AtomAgent:
         self.history.append(HumanMessage(content=user_text))
         self.history.append(AIMessage(content=final_text))
         return final_text
+
+    async def _invoke(self, llm: Any, messages: list[BaseMessage], speaker: Any) -> AIMessage:
+        """Обращение к модели.
+
+        Если передан speaker и модель отвечает текстом (без вызова инструментов),
+        отдаём готовые предложения по мере генерации — питомец начинает говорить,
+        не дожидаясь конца ответа. Как только видим вызов инструмента, озвучку
+        прекращаем: сначала дело, потом слова.
+        """
+        if speaker is None or not hasattr(llm, "astream"):
+            return await llm.ainvoke(messages)
+
+        from core.events import split_sentences
+
+        aggregate = None
+        buffer = ""
+        saw_tool_call = False
+
+        try:
+            async for chunk in llm.astream(messages):
+                aggregate = chunk if aggregate is None else aggregate + chunk
+
+                if getattr(chunk, "tool_call_chunks", None) or getattr(chunk, "tool_calls", None):
+                    saw_tool_call = True
+
+                if saw_tool_call:
+                    continue
+
+                piece = chunk.content if isinstance(chunk.content, str) else ""
+                if not piece:
+                    continue
+                buffer += piece
+
+                # Отдаём всё, кроме последнего незавершённого предложения
+                sentences = split_sentences(buffer)
+                if len(sentences) > 1:
+                    for sentence in sentences[:-1]:
+                        if sentence.strip():
+                            self.spoken_while_streaming = True
+                            await speaker(sentence)
+                    buffer = sentences[-1]
+
+            if not saw_tool_call and buffer.strip():
+                self.spoken_while_streaming = True
+                await speaker(buffer.strip())
+        except Exception as e:  # noqa: BLE001 — падаем обратно на обычный вызов
+            logger.warning(f"Потоковый режим не сработал ({e}), отвечаю целиком")
+            self.spoken_while_streaming = False
+            return await llm.ainvoke(messages)
+
+        if aggregate is None:
+            return AIMessage(content="")
+        return aggregate
 
     @staticmethod
     def _text_of(message: AIMessage) -> str:

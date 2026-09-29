@@ -3,11 +3,84 @@ import EspWebInstallButton from '../components/EspWebInstallButton';
 import { Terminal, Cpu, Zap, Wifi, Server, Key, CheckCircle2, AlertCircle, Usb } from 'lucide-react';
 import { API_BASE } from '../config';
 
+interface DeviceInfo {
+  connected: boolean;
+  device?: string;
+  transport?: string;
+  fw?: string;
+  audio?: boolean;
+  sensors?: boolean;
+  psram?: boolean;
+  mic?: boolean;
+  i2c?: string;
+  heap?: number;
+  ip?: string;
+}
+
+/** Что прошивка сама рассказала о себе: сразу видно, почему нет звука или датчиков. */
+const DeviceHealth: React.FC = () => {
+  const [info, setInfo] = useState<DeviceInfo | null>(null);
+  const [mic, setMic] = useState<{ bytes: number; peak: number } | null>(null);
+
+  useEffect(() => {
+    let alive = true;
+    const load = () => {
+      fetch(`${API_BASE}/api/health`)
+        .then(res => res.json())
+        .then(data => {
+          if (!alive) return;
+          setInfo(data.device);
+          setMic({ bytes: data.audio.mic_bytes, peak: data.audio.mic_peak });
+        })
+        .catch(() => undefined);
+    };
+    load();
+    const timer = setInterval(load, 5000);
+    return () => {
+      alive = false;
+      clearInterval(timer);
+    };
+  }, []);
+
+  if (!info) return null;
+
+  const Row = ({ label, ok, value }: { label: string; ok?: boolean; value: string }) => (
+    <div className="flex items-center justify-between gap-3 py-1.5">
+      <span className="text-xs text-gray-400">{label}</span>
+      <span className={`text-xs font-medium ${ok === undefined ? 'text-gray-300' : ok ? 'text-cyber-emerald' : 'text-red-400'}`}>
+        {value}
+      </span>
+    </div>
+  );
+
+  return (
+    <div className="w-full bg-cyber-navy/40 border border-cyber-navy rounded-2xl p-6 space-y-1">
+      <div className="flex items-center gap-3 mb-2">
+        <div className="p-2.5 bg-cyber-dark rounded-lg ring-1 ring-gray-800">
+          <Cpu className="w-5 h-5 text-cyber-cyan" />
+        </div>
+        <div>
+          <span className="text-xs text-cyber-cyan uppercase font-bold tracking-wider">Диагностика</span>
+          <h3 className="text-lg font-semibold">Состояние устройства</h3>
+        </div>
+      </div>
+
+      <Row label="Связь" ok={info.connected} value={info.connected ? `${info.device ?? 'питомец'} · ${info.transport === 'usb' ? 'USB' : info.ip}` : 'не подключён'} />
+      <Row label="Версия прошивки" value={info.fw ?? 'старая (не сообщает версию)'} ok={info.fw ? true : undefined} />
+      <Row label="Кодек ES8311 (звук)" ok={!!info.audio} value={info.audio ? 'работает' : 'не поднялся'} />
+      <Row label="Микрофон" ok={mic ? mic.bytes > 0 : false} value={mic && mic.bytes > 0 ? `поток идёт, пик ${mic.peak}` : 'нет данных'} />
+      <Row label="Датчик LTR-553" ok={!!info.sensors} value={info.sensors ? 'найден' : `нет${info.i2c ? ` (на шине: ${info.i2c})` : ''}`} />
+      <Row label="PSRAM" ok={!!info.psram} value={info.psram ? '8 МБ' : 'выключен — соберите env m5stack-atoms3r'} />
+      {info.heap !== undefined && <Row label="Свободная память" value={`${info.heap} КБ`} />}
+    </div>
+  );
+};
+
 const InstallPage: React.FC = () => {
   const [ssid, setSsid] = useState(() => localStorage.getItem('pet_ssid') || '');
   const [password, setPassword] = useState(() => localStorage.getItem('pet_password') || '');
   const [serverIp, setServerIp] = useState(() => localStorage.getItem('pet_serverIp') || '192.168.1.100');
-  const [petName, setPetName] = useState(() => localStorage.getItem('pet_petName') || 'Атом');
+  const [petName, setPetName] = useState(() => localStorage.getItem('pet_petName') || 'Патрик');
   
   useEffect(() => { localStorage.setItem('pet_ssid', ssid); }, [ssid]);
   useEffect(() => { localStorage.setItem('pet_password', password); }, [password]);
@@ -44,8 +117,15 @@ const InstallPage: React.FC = () => {
 
     try {
       setIsSending(true);
-      setSerialStatus('Запрос на выбор COM-порта...');
-      
+
+      // COM-порт занят сервером — без этого браузер получает
+      // «Failed to open serial port». Освобождаем и ждём, пока порт отпустят.
+      setSerialStatus('Освобождаю COM-порт у сервера...');
+      await fetch(`${API_BASE}/api/serial/disconnect`, { method: 'POST' }).catch(() => undefined);
+      await new Promise(resolve => setTimeout(resolve, 700));
+
+      setSerialStatus('Выберите COM-порт устройства...');
+
       // Request serial port
       const selectedPort = await (navigator as any).serial.requestPort();
       await selectedPort.open({ baudRate: 115200 });
@@ -63,22 +143,32 @@ const InstallPage: React.FC = () => {
       await writer.write(encoder.encode(payload));
       writer.releaseLock();
 
-      setSerialStatus('Настройки успешно отправлены на M5Stack! Устройство перезагружается...');
+      setSerialStatus('Настройки отправлены, питомец перезагружается...');
       setIsSuccess(true);
 
       setTimeout(async () => {
         try {
           await selectedPort.close();
         } catch (_) {}
-      }, 2000);
+        // Возвращаем порт серверу, иначе питомец останется без связи по USB
+        await fetch(`${API_BASE}/api/serial/connect`, { method: 'POST' }).catch(() => undefined);
+        setSerialStatus('Настройки отправлены, связь с сервером восстановлена.');
+      }, 2500);
 
     } catch (err: any) {
       console.error('Serial Error:', err);
       if (err.name === 'NotFoundError') {
-        setSerialStatus('Выбор порта отменен.');
+        setSerialStatus('Выбор порта отменён.');
+      } else if (String(err.message || '').includes('Failed to open serial port')) {
+        setSerialStatus(
+          'COM-порт занят другой программой. Закройте монитор порта (PlatformIO, Arduino IDE) ' +
+          'или второй экземпляр сервера и попробуйте снова.',
+        );
       } else {
         setSerialStatus(`Ошибка Serial: ${err.message || err}`);
       }
+      // Что бы ни случилось — сервер должен вернуть себе порт
+      await fetch(`${API_BASE}/api/serial/connect`, { method: 'POST' }).catch(() => undefined);
     } finally {
       setIsSending(false);
     }
@@ -185,7 +275,7 @@ const InstallPage: React.FC = () => {
                   required
                   value={petName}
                   onChange={(e) => setPetName(e.target.value)}
-                  placeholder="Например: Атом"
+                  placeholder="Например: Патрик"
                   className="flex-1 bg-cyber-dark border border-gray-800 rounded px-3 py-2 text-sm text-white focus:border-cyber-cyan outline-none transition-colors"
                 />
                 <button
@@ -235,6 +325,8 @@ const InstallPage: React.FC = () => {
         </div>
 
       </div>
+
+      <DeviceHealth />
 
       {/* Footer Info */}
       <div className="text-center text-xs text-gray-500 max-w-md pt-4">

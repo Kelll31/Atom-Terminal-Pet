@@ -26,8 +26,13 @@ from ai.tools.base import ToolSpec, registry
 
 logger = logging.getLogger("core.mcp_client")
 
-BACKEND_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-CONFIG_PATH = os.path.join(BACKEND_DIR, "config", "mcp_servers.yaml")
+from core import paths
+
+BACKEND_DIR = paths.DATA_ROOT
+# Список серверов правит панель, поэтому файл живёт в каталоге данных.
+# При первом запуске он копируется из поставки — иначе пользователь получал бы
+# пустой список вместо готовых примеров.
+CONFIG_PATH = paths.seeded("config", "mcp_servers.yaml")
 
 CALL_TIMEOUT = 90.0
 START_TIMEOUT = 45.0
@@ -135,7 +140,10 @@ class MCPManager:
             command=resolved,
             args=list(state.config.get("args", [])),
             env={**os.environ, **(state.config.get("env") or {})},
-            cwd=state.config.get("cwd") or BACKEND_DIR,
+            # Рабочий каталог — там, где лежит поставка, а не пользовательские
+            # данные: относительные пути в конфигурации (node_modules/...)
+            # указывают на серверы, приехавшие вместе с программой.
+            cwd=state.config.get("cwd") or paths.resource("backend"),
         )
 
         state.task = asyncio.create_task(

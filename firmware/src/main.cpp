@@ -1,415 +1,536 @@
+/**
+ * Atom-Terminal-Pet — прошивка M5Stack AtomS3R + Atomic Echo Base.
+ *
+ * Что делает устройство:
+ *   • непрерывно слушает микрофон и стримит звук серверу (Wi-Fi или USB);
+ *   • проигрывает ответ через ES8311 из кольцевого буфера (отдельная задача);
+ *   • рисует Патрика 128x128 с мимикой под эмоцию и громкость речи;
+ *   • показывает метрики ПК, часы и состояние сети на отдельных экранах;
+ *   • реагирует на кнопку, тряску, наклон и приближение руки (LTR-553);
+ *   • позволяет перебить питомца: кнопка или встряска во время речи.
+ *
+ * Разделение по задачам:
+ *   audio_tx / audio_rx  — единственные владельцы I2S (см. AudioIO);
+ *   serial               — разбор кадров USB, ничего не исполняет сам;
+ *   render               — отрисовка кадра, ядро 0;
+ *   loop()               — всё остальное: кнопка, жесты, команды, стрим микрофона.
+ */
+
 #include <Arduino.h>
-#include <WiFi.h>
 #include <Preferences.h>
-#include <WebSocketsClient.h>
 #include <ArduinoJson.h>
+#include <time.h>
 
-#include "PetState.h"
-#include "PetAnimator.h"
-#include "HardwareIO.h"
+#include "Config.h"
+#include "AudioIO.h"
+#include "Link.h"
+#include "Motion.h"
 #include "PCTracker.h"
+#include "PetAnimator.h"
+#include "PetState.h"
+#include "Sensors.h"
 
-// Forward declarations
-void sendSerialData(uint8_t type, const uint8_t* data, uint32_t length);
+// ── Настройки устройства ────────────────────────────────────────────────────
+static Preferences preferences;
 
-// Configuration
-Preferences preferences;
-char wifi_ssid[64] = "";
-char wifi_pass[64] = "";
-char server_ip[64] = "192.168.1.100";
-const int websocket_port = 8000;
-const char* websocket_path = "/ws/pet";
+static char wifi_ssid[64] = "";
+static char wifi_pass[64] = "";
+static char server_ip[64] = "192.168.1.100";
+static char pet_name[17]  = "Atom";
+static char ota_pass[33]  = "";
+static int  rotation      = 0;
+static bool auto_rotate   = false;   // по умолчанию слушаемся настройки из панели
+static uint8_t volume     = 80;
 
-WebSocketsClient webSocket;
-bool is_wifi_connected = false;
-bool is_ws_connected = false;
-unsigned long lastAudioRxTime = 0;
-bool wsJustConnected = false;       // Flag: transition to LISTENING after WS connect
-unsigned long wsConnectTime = 0;    // Time of last WS connection
+static bool mic_muted = false;
+static bool audio_ok  = false;
+static bool auto_brightness = true;
 
-// Task handles
-TaskHandle_t renderTaskHandle;
+static uint32_t lastStatusSent = 0;
 
-// --- Config Functions ---
-void loadConfig() {
+static void sendDeviceStatus();
+
+// ── Настройки в NVS ─────────────────────────────────────────────────────────
+static void loadConfig() {
     preferences.begin("ai-companion", true);
-    String saved_ssid = preferences.getString("wifi_ssid", "");
-    String saved_pass = preferences.getString("wifi_pass", "");
-    String saved_ip   = preferences.getString("server_ip", "192.168.1.100");
-    int saved_rotation = preferences.getInt("rotation", 0);
+    String savedSsid = preferences.getString("wifi_ssid", "");
+    String savedPass = preferences.getString("wifi_pass", "");
+    String savedIp   = preferences.getString("server_ip", "192.168.1.100");
+    String savedName = preferences.getString("pet_name", "Atom");
+    String savedOta  = preferences.getString("ota_pass", "");
+    rotation    = preferences.getInt("rotation", 0);
+    auto_rotate = preferences.getBool("auto_rot", false);
+    volume      = (uint8_t)preferences.getUChar("volume", 80);
     preferences.end();
-    
-    M5.Display.setRotation(saved_rotation);
 
-    strncpy(wifi_ssid, saved_ssid.c_str(), sizeof(wifi_ssid) - 1);
-    strncpy(wifi_pass, saved_pass.c_str(), sizeof(wifi_pass) - 1);
-    strncpy(server_ip, saved_ip.c_str(), sizeof(server_ip) - 1);
+    strncpy(wifi_ssid, savedSsid.c_str(), sizeof(wifi_ssid) - 1);
+    strncpy(wifi_pass, savedPass.c_str(), sizeof(wifi_pass) - 1);
+    strncpy(server_ip, savedIp.c_str(), sizeof(server_ip) - 1);
+    strncpy(pet_name,  savedName.c_str(), sizeof(pet_name) - 1);
+    strncpy(ota_pass,  savedOta.c_str(), sizeof(ota_pass) - 1);
+
+#ifdef DEFAULT_WIFI_SSID
+    if (strlen(wifi_ssid) == 0) strncpy(wifi_ssid, DEFAULT_WIFI_SSID, sizeof(wifi_ssid) - 1);
+#endif
+#ifdef DEFAULT_WIFI_PASS
+    if (strlen(wifi_pass) == 0) strncpy(wifi_pass, DEFAULT_WIFI_PASS, sizeof(wifi_pass) - 1);
+#endif
+#ifdef DEFAULT_SERVER_IP
+    if (strcmp(server_ip, "192.168.1.100") == 0) strncpy(server_ip, DEFAULT_SERVER_IP, sizeof(server_ip) - 1);
+#endif
+
+    petAnimator.setPetName(pet_name);
 }
 
-void saveConfig(const char* ssid, const char* pass, const char* server) {
+static void saveNetworkConfig(const char* ssid, const char* pass, const char* server,
+                              const char* name, const char* ota) {
     preferences.begin("ai-companion", false);
-    preferences.putString("wifi_ssid", ssid);
-    preferences.putString("wifi_pass", pass);
-    preferences.putString("server_ip", server);
+    if (ssid)   preferences.putString("wifi_ssid", ssid);
+    if (pass)   preferences.putString("wifi_pass", pass);
+    if (server) preferences.putString("server_ip", server);
+    if (name && name[0]) preferences.putString("pet_name", name);
+    if (ota)    preferences.putString("ota_pass", ota);
     preferences.end();
-    
-    strncpy(wifi_ssid, ssid, sizeof(wifi_ssid) - 1);
-    strncpy(wifi_pass, pass, sizeof(wifi_pass) - 1);
-    strncpy(server_ip, server, sizeof(server_ip) - 1);
 }
 
-bool connectWiFi() {
-    if (strlen(wifi_ssid) == 0) {
-        petState.setEmotion(PetEmotion::INIT, "No WiFi Config");
-        return false;
-    }
-    
-    petState.setEmotion(PetEmotion::THINKING, "Connecting WiFi...");
-    WiFi.mode(WIFI_STA);
-    WiFi.begin(wifi_ssid, wifi_pass);
-    
-    unsigned long start = millis();
-    while (WiFi.status() != WL_CONNECTED && millis() - start < 10000) {
-        delay(250);
-    }
-    
-    is_wifi_connected = (WiFi.status() == WL_CONNECTED);
-    if (is_wifi_connected) {
-        String ipStr = WiFi.localIP().toString();
-        petState.setEmotion(PetEmotion::HAPPY, ipStr.c_str());
-    } else {
-        petState.setEmotion(PetEmotion::SAD, "WiFi Fail");
-    }
-    return is_wifi_connected;
-}
-
-// --- WebSocket Handling ---
-void handleJsonCommand(const char* payload) {
+// ── Отчёт о состоянии ───────────────────────────────────────────────────────
+static void sendDeviceStatus() {
     StaticJsonDocument<512> doc;
-    DeserializationError err = deserializeJson(doc, payload);
-    if (err) return;
-    
-    if (doc.containsKey("action")) {
-        String action = doc["action"].as<String>();
-        if (action == "update_pc") {
-            int cpu = doc["cpu"] | 0;
-            int ram = doc["ram"] | 0;
-            int gpu = doc["gpu"] | 0;
-            int temp = doc["temp"] | 0;
-            pcTracker.setMetrics(cpu, ram, gpu, temp);
-            
-            if (doc.containsKey("spotify")) {
-                pcTracker.setSpotify(doc["spotify"].as<const char*>());
-            } else {
-                pcTracker.clearSpotify();
-            }
-        } else if (action == "speak" || action == "set_emotion") {
-            const char* emotion = doc["emotion"] | "idle";
-            const char* text = doc["text"] | "";
-            PetEmotion emo = PetEmotion::IDLE;
-            if (strcmp(emotion, "happy") == 0) emo = PetEmotion::HAPPY;
-            else if (strcmp(emotion, "angry") == 0) emo = PetEmotion::ANGRY;
-            else if (strcmp(emotion, "sleepy") == 0 || strcmp(emotion, "sleeping") == 0) emo = PetEmotion::SLEEPING;
-            else if (strcmp(emotion, "panic") == 0) emo = PetEmotion::PANIC;
-            else if (strcmp(emotion, "sad") == 0) emo = PetEmotion::SAD;
-            else if (strcmp(emotion, "love") == 0) emo = PetEmotion::LOVE;
-            else if (strcmp(emotion, "dizzy") == 0) emo = PetEmotion::DIZZY;
-            else if (strcmp(emotion, "talking") == 0) emo = PetEmotion::TALKING;
-            else if (strcmp(emotion, "listening") == 0) emo = PetEmotion::LISTENING;
-            else if (strcmp(emotion, "thinking") == 0) emo = PetEmotion::THINKING;
-            else if (strcmp(emotion, "party") == 0) emo = PetEmotion::PARTY;
-            else if (strcmp(emotion, "sweat") == 0) emo = PetEmotion::SWEAT;
-            else if (strcmp(emotion, "working") == 0) emo = PetEmotion::WORKING;
-            petState.setEmotion(emo, text);
-        } else if (action == "pomodoro") {
-            int timeLeft = doc["time_left"] | 0;
-            pcTracker.setPomodoro(timeLeft);
-        } else if (action == "set_rotation") {
-            int r = doc["rotation"] | 0;
-            M5.Display.setRotation(r);
-            preferences.begin("ai-companion", false);
-            preferences.putInt("rotation", r);
-            preferences.end();
+    doc["action"]  = "device_status";
+    doc["device"]  = "AtomS3R";
+    doc["fw"]      = FW_VERSION;
+    doc["ip"]      = netLink.ip();
+    doc["ssid"]    = netLink.wifiConnected() ? String(netLink.ssid()) : String("usb");
+    doc["rssi"]    = netLink.rssi();
+    doc["mic"]     = !mic_muted;
+    doc["audio"]   = audio_ok;
+    doc["sensors"] = sensors.isAvailable();
+    doc["i2c"]     = sensors.getBusReport();
+    doc["psram"]   = psramFound();
+    doc["heap"]    = (int)(ESP.getFreeHeap() / 1024);
+    doc["volume"]  = volume;
+    // Счётчики потерь помогают отличить «сеть тормозит» от «прошивка не успевает»
+    doc["drop_out"] = audioIO.droppedPlayBytes();
+    doc["drop_in"]  = audioIO.droppedMicChunks();
+    netLink.sendJson(doc);
+    lastStatusSent = millis();
+}
+
+static void sendSimpleEvent(const char* action, const char* key = nullptr,
+                            const char* value = nullptr, int number = 0) {
+    StaticJsonDocument<128> doc;
+    doc["action"] = action;
+    if (key && value) doc[key] = value;
+    else if (key)     doc[key] = number;
+    netLink.sendJson(doc);
+}
+
+// Прерывание речи: чистим буфер и сообщаем серверу
+static void interruptSpeech(const char* reason) {
+    audioIO.stopPlayback();
+    petState.setEmotion(PetEmotion::LISTENING, "Slushayu");
+    petState.resetIdleTimer();
+    petAnimator.showBubble("Slushayu!", 2000);
+    audioIO.playChime(Chime::LISTEN);
+    sendSimpleEvent("interrupt", "reason", reason);
+}
+
+// ── Команды сервера ─────────────────────────────────────────────────────────
+static PetEmotion parseEmotion(const char* name) {
+    if (!name) return PetEmotion::IDLE;
+    if (!strcmp(name, "happy"))     return PetEmotion::HAPPY;
+    if (!strcmp(name, "angry"))     return PetEmotion::ANGRY;
+    if (!strcmp(name, "sad"))       return PetEmotion::SAD;
+    if (!strcmp(name, "love"))      return PetEmotion::LOVE;
+    if (!strcmp(name, "dizzy"))     return PetEmotion::DIZZY;
+    if (!strcmp(name, "sleepy") || !strcmp(name, "sleeping")) return PetEmotion::SLEEPING;
+    if (!strcmp(name, "working"))   return PetEmotion::WORKING;
+    if (!strcmp(name, "listening")) return PetEmotion::LISTENING;
+    if (!strcmp(name, "talking"))   return PetEmotion::TALKING;
+    if (!strcmp(name, "thinking"))  return PetEmotion::THINKING;
+    if (!strcmp(name, "panic"))     return PetEmotion::PANIC;
+    if (!strcmp(name, "sweat"))     return PetEmotion::SWEAT;
+    if (!strcmp(name, "party"))     return PetEmotion::PARTY;
+    return PetEmotion::IDLE;
+}
+
+static void applyRotation(int value) {
+    rotation = value & 3;
+    petAnimator.requestRotation(rotation);
+}
+
+// Вызывается только из основного цикла (Link складывает команды в очередь),
+// поэтому можно спокойно трогать дисплей, NVS и анимацию.
+static void handleCommand(const char* payload) {
+    StaticJsonDocument<768> doc;
+    if (deserializeJson(doc, payload)) return;
+
+    if (!doc.containsKey("action")) {
+        if (doc.containsKey("ssid")) {  // конфигурация Wi-Fi из панели
+            saveNetworkConfig(doc["ssid"] | "", doc["pass"] | "", doc["server"] | server_ip,
+                              doc["pet_name"] | pet_name, doc["ota_pass"] | ota_pass);
+            petAnimator.showBubble("Saved, restarting", 2000);
+            delay(600);
+            ESP.restart();
         }
+        return;
+    }
+
+    const char* action = doc["action"];
+
+    if (!strcmp(action, "update_pc")) {
+        pcTracker.setMetrics(doc["cpu"] | 0, doc["ram"] | 0, doc["gpu"] | 0, doc["temp"] | 0);
+        if (doc.containsKey("spotify")) pcTracker.setSpotify(doc["spotify"] | "");
+        else pcTracker.clearSpotify();
+        if (doc.containsKey("time_left")) pcTracker.setPomodoro(doc["time_left"] | 0);
+
+    } else if (!strcmp(action, "speak") || !strcmp(action, "set_emotion")) {
+        PetEmotion emotion = parseEmotion(doc["emotion"] | "idle");
+        const char* text = doc["text"] | "";
+        petState.setEmotion(emotion, "");
+        petState.resetIdleTimer();
+        if (text[0]) petAnimator.showBubble(text, 9000);
+
+    } else if (!strcmp(action, "agent_status")) {
+        const char* state = doc["state"] | "";
+        if (!strcmp(state, "thinking"))      petState.setEmotion(PetEmotion::THINKING, "");
+        else if (!strcmp(state, "working"))  petState.setEmotion(PetEmotion::WORKING, doc["tool"] | "");
+        else if (!strcmp(state, "speaking")) petState.setEmotion(PetEmotion::TALKING, "");
+        else if (!strcmp(state, "idle"))     petState.setBaseEmotion(PetEmotion::LISTENING, "");
+
+    } else if (!strcmp(action, "listening")) {
+        petState.setBaseEmotion(PetEmotion::LISTENING, "");
+
+    } else if (!strcmp(action, "stop_audio")) {
+        audioIO.stopPlayback();
+        petState.setEmotion(PetEmotion::LISTENING, "");
+
+    } else if (!strcmp(action, "beep")) {
+        audioIO.playChime(Chime::NOTIFY);
+
+    } else if (!strcmp(action, "pomodoro")) {
+        pcTracker.setPomodoro(doc["time_left"] | 0);
+        petState.setEmotion(PetEmotion::WORKING, "Focus");
+
+    } else if (!strcmp(action, "set_rotation")) {
+        // Явный поворот из панели выключает автоповорот: иначе IMU тут же
+        // возвращал экран обратно, и настройка выглядела сломанной.
+        auto_rotate = false;
+        applyRotation(doc["rotation"] | 0);
+        preferences.begin("ai-companion", false);
+        preferences.putInt("rotation", rotation);
+        preferences.putBool("auto_rot", false);
+        preferences.end();
+
+    } else if (!strcmp(action, "set_autorotate")) {
+        auto_rotate = doc["enabled"] | false;
+        preferences.begin("ai-companion", false);
+        preferences.putBool("auto_rot", auto_rotate);
+        preferences.end();
+
+    } else if (!strcmp(action, "set_screen")) {
+        petAnimator.setScreen((PetScreen)(doc["screen"] | 0));
+
+    } else if (!strcmp(action, "set_brightness")) {
+        if (doc["auto"] | false) {
+            auto_brightness = true;
+        } else {
+            auto_brightness = false;
+            M5.Display.setBrightness(constrain((int)(doc["value"] | 128), 10, 255));
+        }
+
+    } else if (!strcmp(action, "set_volume")) {
+        volume = (uint8_t)constrain((int)(doc["value"] | 80), 0, 100);
+        audioIO.setVolume(volume);
+        preferences.begin("ai-companion", false);
+        preferences.putUChar("volume", volume);
+        preferences.end();
+
+    } else if (!strcmp(action, "set_mic")) {
+        mic_muted = !(doc["enabled"] | true);
+        audioIO.setMicMuted(mic_muted);
+        sendDeviceStatus();
+
+    } else if (!strcmp(action, "identify")) {
+        petState.setEmotion(PetEmotion::PARTY, "Eto ya!");
+        audioIO.playChime(Chime::PARTY);
+
+    } else if (!strcmp(action, "restart")) {
+        petAnimator.showBubble("Restarting", 1000);
+        delay(400);
+        ESP.restart();
+
+    } else if (!strcmp(action, "status")) {
+        sendDeviceStatus();
     }
 }
 
-void webSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
-    switch(type) {
-        case WStype_DISCONNECTED:
-            is_ws_connected = false;
-            petState.setEmotion(PetEmotion::SAD, "WS Reconnecting...");
+// ── Взаимодействие ──────────────────────────────────────────────────────────
+static void handleButton() {
+    static bool longHoldHandled = false;
+
+    ButtonEvent event = motion.pollButton();
+
+    if (event != ButtonEvent::LONG_HOLD) longHoldHandled = false;
+    if (event == ButtonEvent::NONE) return;
+
+    petState.resetIdleTimer();
+
+    // Во время речи любое нажатие — «дай сказать»
+    if (event == ButtonEvent::CLICK && audioIO.isSpeaking()) {
+        interruptSpeech("button");
+        return;
+    }
+
+    switch (event) {
+        case ButtonEvent::CLICK:
+            petState.addAttention(20);
+            petState.setEmotion(PetEmotion::LOVE, "Mur!");
+            petAnimator.poke();
+            audioIO.playChime(Chime::OK);
+            sendSimpleEvent("pet_touched", "source", "button");
             break;
-        case WStype_CONNECTED:
-            is_ws_connected = true;
-            petState.setEmotion(PetEmotion::HAPPY, "Online");
-            wsJustConnected = true;    // Will auto-transition to LISTENING after 3s
-            wsConnectTime = millis();
-            {
-                StaticJsonDocument<256> statusDoc;
-                statusDoc["action"] = "device_status";
-                statusDoc["device"] = "AtomS3";
-                statusDoc["ip"] = WiFi.localIP().toString();
-                statusDoc["ssid"] = WiFi.SSID();
-                statusDoc["rssi"] = WiFi.RSSI();
-                String statusStr;
-                serializeJson(statusDoc, statusStr);
-                webSocket.sendTXT(statusStr);
-                sendSerialData(0x01, (const uint8_t*)statusStr.c_str(), statusStr.length());
+
+        case ButtonEvent::DOUBLE_CLICK:
+            petAnimator.nextScreen();
+            audioIO.playChime(Chime::TICK);
+            break;
+
+        case ButtonEvent::HOLD:
+            mic_muted = !mic_muted;
+            audioIO.setMicMuted(mic_muted);
+            petAnimator.showBubble(mic_muted ? "Mic OFF" : "Mic ON", 2500);
+            audioIO.playChime(mic_muted ? Chime::ERROR : Chime::LISTEN);
+            sendDeviceStatus();
+            break;
+
+        case ButtonEvent::LONG_HOLD:
+            if (!longHoldHandled) {
+                longHoldHandled = true;
+                petAnimator.setScreen(PetScreen::INFO);
+            }
+            if (M5.BtnA.pressedFor(6000)) {
+                petAnimator.showBubble("Restarting", 1200);
+                delay(500);
+                ESP.restart();
             }
             break;
-        case WStype_TEXT:
-            handleJsonCommand((const char*)payload);
-            break;
-        case WStype_BIN:
-            lastAudioRxTime = millis();
-            if (petState.getEmotion() != PetEmotion::TALKING) {
-                petState.setEmotion(PetEmotion::TALKING);
-            }
-            hardwareIO.enqueueAudio(payload, length);
-            break;
+
         default:
             break;
     }
 }
 
-void sendSerialData(uint8_t type, const uint8_t* data, uint32_t length) {
-    if (!Serial) return;
-    uint8_t header[7];
-    header[0] = 0xAA;
-    header[1] = 0xBB;
-    header[2] = type;
-    header[3] = length & 0xFF;
-    header[4] = (length >> 8) & 0xFF;
-    header[5] = (length >> 16) & 0xFF;
-    header[6] = (length >> 24) & 0xFF;
-    Serial.write(header, 7);
-    Serial.write(data, length);
-}
+static void handleGestures() {
+    if (motion.isShaking()) {
+        const int count = motion.shakeCount();
+        petState.resetIdleTimer();
 
-// --- Serial Protocol Handling ---
-void processSerial() {
-    static int state = 0;
-    static uint8_t msg_type = 0;
-    static uint32_t msg_length = 0;
-    static uint32_t bytes_read = 0;
-    static uint8_t* payload_buffer = nullptr;
-    static String text_buffer = ""; // For plain-text JSON fallback
-
-    while (Serial.available()) {
-        if (state == 0) { // Waiting for 0xAA or '{'
-            uint8_t b = Serial.read();
-            if (b == 0xAA) {
-                state = 1;
-            } else if (b == '{') {
-                // Legacy plain-text JSON started!
-                text_buffer = "{";
-                state = 10;
-            }
-        } else if (state == 10) { // Reading plain-text JSON until newline
-            char c = Serial.read();
-            if (c == '\n' || c == '\r') {
-                if (text_buffer.length() > 0) {
-                    StaticJsonDocument<512> doc;
-                    DeserializationError err = deserializeJson(doc, text_buffer);
-                    if (!err) {
-                        if (doc.containsKey("ssid")) {
-                            saveConfig(doc["ssid"] | "", doc["pass"] | "", doc["server"] | server_ip);
-                            ESP.restart();
-                        } else {
-                            handleJsonCommand(text_buffer.c_str());
-                        }
-                    }
-                }
-                text_buffer = "";
-                state = 0;
-            } else {
-                text_buffer += c;
-                if (text_buffer.length() > 512) state = 0; // Prevent overflow
-            }
-        } else if (state == 1) { // Waiting for 0xBB
-            if (Serial.read() == 0xBB) state = 2;
-            else state = 0;
-        } else if (state == 2) { // Read Type
-            msg_type = Serial.read();
-            state = 3;
-            bytes_read = 0;
-            msg_length = 0;
-        } else if (state == 3) { // Read Length (4 bytes, little endian)
-            msg_length |= (Serial.read() << (bytes_read * 8));
-            bytes_read++;
-            if (bytes_read == 4) {
-                if (msg_length > 0 && msg_length < 1000000) { // Sanity check
-                    payload_buffer = (uint8_t*)malloc(msg_length + 1);
-                    if (!payload_buffer) {
-                        state = 0; // OOM
-                    } else {
-                        state = 4;
-                        bytes_read = 0;
-                    }
-                } else {
-                    state = 0; // Invalid length
-                }
-            }
-        } else if (state == 4) { // Read Payload
-            int avail = Serial.available();
-            int to_read = msg_length - bytes_read;
-            if (avail > to_read) avail = to_read;
-            
-            Serial.readBytes(&payload_buffer[bytes_read], avail);
-            bytes_read += avail;
-            
-            if (bytes_read == msg_length) {
-                if (msg_type == 0x01) { // JSON
-                    payload_buffer[msg_length] = '\0'; // Null terminate string
-                    String input = String((char*)payload_buffer);
-                    StaticJsonDocument<512> doc;
-                    DeserializationError err = deserializeJson(doc, input);
-                    if (!err) {
-                        if (doc.containsKey("ssid")) {
-                            saveConfig(doc["ssid"] | "", doc["pass"] | "", doc["server"] | server_ip);
-                            ESP.restart();
-                        } else {
-                            handleJsonCommand(input.c_str());
-                        }
-                    }
-                } else if (msg_type == 0x02) { // Binary Audio
-                    lastAudioRxTime = millis();
-                    if (petState.getEmotion() != PetEmotion::TALKING) {
-                        petState.setEmotion(PetEmotion::TALKING);
-                    }
-                    hardwareIO.enqueueAudio(payload_buffer, msg_length);
-                }
-                free(payload_buffer);
-                payload_buffer = nullptr;
-                state = 0;
-            }
-        }
-    }
-}
-
-// --- FreeRTOS Tasks ---
-void taskRender(void *pvParameters) {
-    // Run indefinitely
-    while (true) {
-        unsigned long start = millis();
-        
-        petAnimator.updateTargets(hardwareIO.getPitch(), hardwareIO.getRoll());
-        petAnimator.renderFrame();
-        
-        // Try to keep ~30 FPS (33ms per frame)
-        unsigned long duration = millis() - start;
-        if (duration < 33) {
-            vTaskDelay((33 - duration) / portTICK_PERIOD_MS);
+        if (audioIO.isSpeaking()) {
+            interruptSpeech("shake");
+        } else if (count >= 5) {
+            petState.setEmotion(PetEmotion::PARTY, "Party!");
+            audioIO.playChime(Chime::PARTY);
+        } else if (count >= 3) {
+            petState.setEmotion(PetEmotion::DIZZY, "Dizzy!");
         } else {
-            vTaskDelay(1 / portTICK_PERIOD_MS); // Yield
+            petState.setEmotion(PetEmotion::HAPPY, "Hey!");
+            petAnimator.poke();
+        }
+
+        sendSimpleEvent("shake", "count", nullptr, count);
+        motion.clearShake();
+    }
+
+    if (motion.wasTapped()) {
+        motion.clearTap();
+        petAnimator.poke();
+        petState.addAttention(5);
+    }
+
+    // Рука рядом — гладят (датчик приближения LTR-553)
+    if (sensors.wasHandWaved()) {
+        petState.addAttention(15);
+        petState.setEmotion(PetEmotion::LOVE, "Pat pat");
+        petAnimator.poke();
+        audioIO.playChime(Chime::OK);
+        sendSimpleEvent("pet_touched", "source", "proximity");
+    }
+
+    // Перевернули экраном вниз — «спрятался» и выключил микрофон
+    static bool wasFaceDown = false;
+    const bool faceDown = motion.isFaceDown();
+    if (faceDown != wasFaceDown) {
+        wasFaceDown = faceDown;
+        if (faceDown) {
+            petState.setEmotion(PetEmotion::SLEEPING, "zzz");
+            audioIO.setMicMuted(true);
+        } else {
+            audioIO.setMicMuted(mic_muted);
+            petState.setEmotion(PetEmotion::HAPPY, "Hi!");
+            petState.resetIdleTimer();
+        }
+    }
+
+    if (auto_rotate && motion.orientationChanged()) {
+        applyRotation(motion.orientation());
+    }
+}
+
+static void handleBrightness() {
+    static uint32_t lastCheck = 0;
+    static uint8_t current = 0;
+
+    if (!auto_brightness) return;   // яркость задана из панели вручную
+
+    const uint32_t now = millis();
+    if (now - lastCheck < 2000) return;
+    lastCheck = now;
+
+    uint8_t target = sensors.isAvailable() ? sensors.suggestedBrightness() : 130;
+
+    // Никто не трогал 5 минут и тишина — приглушаем экран
+    if (now - motion.lastMotionMs() > 300000 && !audioIO.isPlaying()) {
+        target = target / 3;
+    }
+
+    if (current != target) {
+        current = target;
+        M5.Display.setBrightness(target);
+    }
+}
+
+// Появление и пропажа сети — событие, о котором стоит сказать вслух и на экране.
+static void handleConnectivity() {
+    static bool wifiWas = false;
+    static bool serverWas = false;
+
+    const bool wifiNow = netLink.wifiConnected();
+    if (wifiNow != wifiWas) {
+        wifiWas = wifiNow;
+        if (wifiNow) {
+            petAnimator.setNetworkInfo(netLink.ssid(), netLink.ip().c_str(), netLink.rssi());
+            petState.setEmotion(PetEmotion::HAPPY, "WiFi OK");
+            audioIO.playChime(Chime::OK);
+            configTime(3 * 3600, 0, "pool.ntp.org", "time.google.com");
+            netLink.enableOta(ota_pass);
+        } else {
+            petAnimator.setNetworkInfo("-", "usb", 0);
+            petAnimator.showBubble("Wi-Fi lost, USB mode", 4000);
+        }
+    }
+
+    const bool serverNow = netLink.wsConnected();
+    if (serverNow != serverWas) {
+        serverWas = serverNow;
+        if (serverNow) {
+            petState.setEmotion(PetEmotion::HAPPY, "Online");
+            petState.setBaseEmotion(PetEmotion::LISTENING, "");
+            audioIO.playChime(Chime::OK);
+            sendDeviceStatus();
+        } else {
+            petState.setBaseEmotion(PetEmotion::IDLE, "");
         }
     }
 }
 
-// --- Main Setup and Loop ---
+// ── Задача отрисовки ────────────────────────────────────────────────────────
+static void taskRender(void*) {
+    TickType_t wake = xTaskGetTickCount();
+    while (true) {
+        petAnimator.setAudioLevel(audioIO.playbackLevel());
+        petAnimator.setMicLevel(audioIO.micLevel());
+        petAnimator.setFlags(mic_muted, netLink.wifiConnected(), netLink.serverOnline(),
+                             sensors.isAvailable());
+        petAnimator.setClock(time(nullptr) > 1700000000);
+        petAnimator.updateTargets(motion.pitch(), motion.roll());
+        petAnimator.renderFrame();
+
+        // Ровная частота кадров вместо «сколько получилось»: анимация перестала
+        // дёргаться, когда сеть или NVS отнимали время у ядра.
+        vTaskDelayUntil(&wake, pdMS_TO_TICKS(RENDER_PERIOD_MS));
+    }
+}
+
+// ── setup / loop ────────────────────────────────────────────────────────────
 void setup() {
     auto cfg = M5.config();
+    cfg.serial_baudrate = 0;   // порт поднимает Link — ему нужен большой буфер
     M5.begin(cfg);
-    Serial.begin(115200);
 
-    // Initialize modules
-    petAnimator.init();
-    hardwareIO.init();
-    
+    M5.Display.setBrightness(140);
+
     loadConfig();
-    
-    if (connectWiFi()) {
-        webSocket.begin(server_ip, websocket_port, websocket_path);
-        webSocket.onEvent(webSocketEvent);
-        webSocket.setReconnectInterval(5000);
-        hardwareIO.startRecording(); // Start continuous recording
+    applyRotation(rotation);
+
+    if (!petAnimator.init()) {
+        M5.Display.fillScreen(TFT_RED);
+        M5.Display.drawString("no memory", 8, 56);
     }
-    
-    // Create Render Task on Core 0 (App core is 1, PRO core is 0)
-    xTaskCreatePinnedToCore(
-        taskRender,     // Task function
-        "RenderTask",   // Name
-        8192,           // Stack size
-        NULL,           // Parameters
-        1,              // Priority
-        &renderTaskHandle, // Handle
-        0               // Core ID (0)
-    );
+    motion.begin();
+    sensors.init();
+
+    audio_ok = audioIO.begin();
+    if (audio_ok) audioIO.setVolume(volume);
+
+    petState.setEmotion(PetEmotion::INIT, "Boot");
+    xTaskCreatePinnedToCore(taskRender, "render", STACK_RENDER, nullptr, PRIO_RENDER, nullptr, 0);
+
+    netLink.onCommand(handleCommand);
+    netLink.begin(wifi_ssid, wifi_pass, server_ip, pet_name);
+
+    if (audio_ok) {
+        audioIO.playChime(Chime::BOOT);
+        audioIO.startRecording();
+    } else {
+        petAnimator.showBubble("Audio codec not found", 6000);
+    }
+
+    if (!wifi_ssid[0]) {
+        petAnimator.showBubble("Nastroy Wi-Fi cherez USB", 8000);
+    }
+
+    petState.setBaseEmotion(PetEmotion::LISTENING, "");
+    sendDeviceStatus();
 }
 
 void loop() {
-    // Core 1 (Main Loop) handles logic, WiFi, WS, IO
-    hardwareIO.update();
+    M5.update();
+    motion.update();
     petState.update();
     pcTracker.update();
-    
-    if (is_wifi_connected) {
-        webSocket.loop();
-    } else {
-        // Fallback: If WiFi fails but we are connected via USB, start recording anyway
-        if (!hardwareIO.isRecording() && Serial) {
-            hardwareIO.startRecording();
-            petState.setEmotion(PetEmotion::HAPPY, "USB Connected");
-        }
-    }
-    
-    processSerial();
-    
-    // Auto-detect end of audio playback.
-    // Wait for BOTH conditions to prevent echo (mic picking up speaker):
-    //   1. Backend has stopped sending chunks (350ms silence on WebSocket)
-    //   2. I2S DMA has drained after last play() call (500ms > chunk duration of 128ms)
-    unsigned long now = millis();
-    if (petState.getEmotion() == PetEmotion::TALKING 
-        && (now - lastAudioRxTime > 350)
-        && (now - hardwareIO.getLastPlayTime() > 500)) {
-        hardwareIO.stopAudioPlayback(); // Zero out DMA buffer to eliminate repeating noise
-        hardwareIO.resetRecordBuffer(); // Flush mic buffer recorded during speech
-        petState.setEmotion(PetEmotion::LISTENING, "Listening...");
+    sensors.update();
+
+    netLink.loop();
+
+    handleConnectivity();
+    handleButton();
+    handleGestures();
+    handleBrightness();
+
+    const uint32_t now = millis();
+
+    // Речь закончилась — снова слушаем
+    if (petState.getEmotion() == PetEmotion::TALKING && !audioIO.isSpeaking()) {
+        petState.setEmotion(PetEmotion::LISTENING, "");
     }
 
-    // Handle continuous audio streaming
-    // IMPORTANT: send via only ONE channel to prevent duplicate STT/TTS pipeline triggers.
-    // When WiFi is connected, M5 uses WebSocket; Serial is fallback for USB-only mode.
-    if (hardwareIO.isRecording() && hardwareIO.hasAudioChunk() && petState.getEmotion() != PetEmotion::TALKING) {
-        size_t len = hardwareIO.getRecordSize();
-        if (len > 0) {
-            if (is_ws_connected) {
-                webSocket.sendBIN(hardwareIO.getRecordBuffer(), len); // WiFi preferred
-            } else {
-                sendSerialData(0x02, hardwareIO.getRecordBuffer(), len); // USB-only fallback
-            }
-        }
-        hardwareIO.resetRecordBuffer();
+    // Микрофон: задача записи уже отдала готовый кадр 32 мс — просто пересылаем.
+    // За проход отдаём не больше двух кадров, чтобы цикл оставался отзывчивым.
+    for (int i = 0; i < 2; i++) {
+        size_t length = 0;
+        const uint8_t* chunk = audioIO.takeChunk(length);
+        if (!chunk) break;
+        netLink.sendAudio(chunk, length);
+        audioIO.releaseChunk();
     }
-    
-    // Handle shake events -> notify backend
-    static bool wasShaking = false;
-    if (hardwareIO.isShaking()) {
-        if (!wasShaking) {
-            wasShaking = true;
-            StaticJsonDocument<128> shakeDoc;
-            shakeDoc["action"] = "shake";
-            shakeDoc["count"] = hardwareIO.getShakeCount();
-            String shakeStr;
-            serializeJson(shakeDoc, shakeStr);
-            if (is_ws_connected) webSocket.sendTXT(shakeStr);
-            sendSerialData(0x01, (const uint8_t*)shakeStr.c_str(), shakeStr.length());
-        }
-    } else {
-        wasShaking = false;
+
+    // Звук пошёл в динамик — значит питомец говорит
+    if (audioIO.isSpeaking() && petState.getEmotion() != PetEmotion::TALKING) {
+        petState.setEmotion(PetEmotion::TALKING, "");
     }
-    
-    // Auto-transition from HAPPY to LISTENING state after WebSocket connects.
-    // Without this, device stays HAPPY forever (no LISTENING animation shown until first TTS).
-    if (wsJustConnected && millis() - wsConnectTime > 3000) {
-        wsJustConnected = false;
-        if (hardwareIO.isRecording() && petState.getEmotion() == PetEmotion::HAPPY) {
-            petState.setEmotion(PetEmotion::LISTENING, "Listening...");
-        }
-    }
-    
-    // Don't starve watchdog
-    delay(5);
+
+    if (now - lastStatusSent > STATUS_PERIOD_MS) sendDeviceStatus();
+
+    delay(2);
 }

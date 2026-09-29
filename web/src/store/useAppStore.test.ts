@@ -72,6 +72,23 @@ describe('useAppStore', () => {
     expect(useAppStore.getState().approvals).toHaveLength(0);
   });
 
+  it('сбрасывает флаг речи питомца при перебивании', () => {
+    useAppStore.setState({
+      voice: {
+        speaking: false,
+        level: 0.2,
+        noiseFloor: 0.01,
+        conversationOpen: true,
+        conversationLeft: 20,
+        petSpeaking: true,
+        lastIgnored: '',
+      },
+    });
+
+    useAppStore.getState().interruptPet();
+    expect(useAppStore.getState().voice.petSpeaking).toBe(false);
+  });
+
   it('обновляет задачу по идентификатору, а не дублирует её', () => {
     const task = makeTask();
     useAppStore.setState({ tasks: [task] });

@@ -5,8 +5,8 @@
   "temperature": 0.4,
   "max_steps": 12,
 
-  "pet_name": "Атом",
-  "wake_words": ["атом", "atom", "автом", "а том", "отом"],
+  "pet_name": "Патрик",
+  "wake_words": ["Патрик", "atom", "автом", "а том", "отом"],
   "require_wake_word": true,
   "speak_replies": true,
   "max_speech_chars": 400,
